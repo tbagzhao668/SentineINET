@@ -67,5 +67,5 @@ npm run dev -- --host --port 5175
 
 ## 运行前需要做的配置
 
-- AI 配置：进入网页的 AI 配置页填写 `api_key / model / base_url`（仓库不会提交真实密钥）。
+- AI 配置：进入网页的 AI 配置页填写 `api_key / model / base_url`。
 - 资产设备：在“资产管理”里添加设备，或直接编辑 `backend/app/db.json` 中的 `devices`（测试环境）。
