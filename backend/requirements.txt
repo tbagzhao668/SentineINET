@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+netmiko
+sqlalchemy
+cryptography
+python-dotenv
+openai
+requests
+pytest
+httpx
