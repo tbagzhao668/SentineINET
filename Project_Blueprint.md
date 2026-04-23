@@ -1,40 +1,41 @@
-# SentinelAI 项目开发蓝图
+# SentinelNet（SentinelAI）项目开发蓝图
 
 ## 1. 项目愿景
-打造一个轻量级、智能化的防火墙自动化运维 Web 平台，通过 AI 赋能安全日志分析与策略下发，实现“发现-分析-封堵-备份”的自动化闭环。
+打造一个轻量级的网络运维与安全平台：以“资产库设备”为中心，通过自动巡检、拓扑可视化与网络 AI 助手（Agent）实现“可观测 → 可执行 → 可复用（Skill）”的闭环。
 
-## 2. 团队分配
-- **PM/负责人**: 我 (负责整体架构与质量把控)
-- **后端工程师 (Lao Wang)**: 负责 FastAPI, SSH (Netmiko) 通讯, SQLite 存储, 备份/回滚逻辑。
-- **前端工程师 (Xiao Chen)**: 负责 React UI, Tailwind CSS, 引导配置向导, 实时日志流显示。
-- **AI/安全工程师 (Xiao Lin)**: 负责 Prompt 调优, 多品牌日志特征提取, 策略翻译引擎。
+## 2. 模块划分
+- **前端（Web UI）**：资产管理、巡检看板、拓扑交互、AI 助手对话与步骤执行面板。
+- **后端（API）**：设备接入与命令执行、巡检调度、拓扑采集与解析、Skill Hub、Agent 会话与运行状态机。
+- **存储（轻量化持久化）**：以 `backend/app/db.json` 作为单文件持久化（设备/AI 配置/Skill/会话/备份服务器等）。
 
 ## 3. 技术栈选型
-- **Frontend**: React 18 + Tailwind CSS + Lucide Icons (图标) + Axios。
-- **Backend**: Python 3.10+ + FastAPI + Netmiko (网络驱动) + SQLAlchemy (数据库)。
-- **AI**: 支持 OpenAI, Gemini, Claude 等主流模型 API 接入。
-- **OS**: 兼容 Windows/Linux/macOS 部署。
+- **Frontend**：React + Vite + Tailwind CSS + Lucide Icons + Axios。
+- **Backend**：Python + FastAPI + Netmiko + Uvicorn。
+- **AI**：OpenAI 兼容接口（支持自定义 `base_url`，例如 DeepSeek/OpenAI 等）。
+- **部署**：Docker Compose 一条命令启动（可选）；也支持 Windows/Linux 开发模式运行。
 
-## 4. 品牌适配方案 (首批支持)
-| 品牌 | 驱动类型 | 日志提取命令示例 | 策略下发方式 |
-| :--- | :--- | :--- | :--- |
-| **Cisco ASA** | cisco_asa | show logging | access-list / object-group |
-| **Huawei** | huawei | display logbuffer | acl / traffic-filter |
-| **H3C** | hp_comware | display logbuffer | acl / packet-filter |
-| **Fortinet** | fortinet | get log traffic | firewall policy |
-| **Sangfor** | generic_ssh | (API/CLI 混合) | CLI |
-| **Ruijie** | ruijie | show logging | ip access-list |
+## 4. 设备品牌与协议适配
+### 4.1 已验证
+- **Huawei VRP**：Telnet 方式接入，支持查询类命令与配置类命令下发（受 allow_config 安全闸门控制）。
+
+### 4.2 规划支持（按需扩展）
+- 通过 Netmiko 的驱动生态扩展 SSH/Telnet 设备类型（以“意图→命令→验证→沉淀 Skill”的方式逐步覆盖）。
 
 ## 5. 核心流程设计
-1. **引导配置**: Web 弹出 Step-by-step 向导，配置 SSH 凭据、AI API Key、日志过滤词。
-2. **日志循环**: 后端定时或通过 Syslog 接收日志，利用预设关键词（如 Deny/Drop）初筛。
-3. **AI 分析**: 过滤后的日志发送至 AI，输出 JSON 格式风险报告（包含攻击 IP、风险等级、封堵建议）。
-4. **决策下发**: 用户在 Web 端勾选需要封堵的 IP，系统执行：`备份配置 -> 生成命令 -> SSH 下发 -> 验证连通性`。
-5. **回滚机制**: 每次变更生成版本号，支持一键还原上一个备份文件。
+1. **资产库**：用户维护设备资产（品牌/协议/地址/凭据/巡检间隔/可选备份服务器关联）。
+2. **巡检调度**：后端周期性执行连通性与健康巡检，输出看板状态与指标（CPU/内存/温度等，按设备能力解析）。
+3. **拓扑采集**：对启用范围的设备采集 LLDP 输出，优先复用已验证 Skill；无大模型时可本地解析生成拓扑。
+4. **网络 AI 助手（Agent）**：
+   - 用户自然语言输入 → 先生成可执行计划（plan）→ 进入工具调用执行。
+   - 支持自动执行与“步骤级执行状态机”（逐步执行/失败重试）。
+   - 成功跑通的意图会自动沉淀为 Skill，后续优先复用（越用越聪明）。
+5. **安全策略下发（可选）**：对高风险变更提供额外限制（配置开关/危险命令拦截/参数一致性校验），并记录策略历史。
 
 ## 6. 安全与隐私
-- SSH 密码与 API Key 使用 AES-256 加密存储。
-- 敏感操作必须经过 Web 端二次确认。
+- **设备操作安全闸门**：默认 `allow_config=false`，仅允许只读命令；开启后才允许下发配置。
+- **高风险命令拦截**：对 `format/delete/erase/reboot/reset/restore/shutdown` 等关键词拒绝执行。
+- **参数一致性校验（步骤执行）**：步骤文本里出现的设备ID/接口/VLAN/IP 等关键参数必须出现在下发命令中，避免模型“跑偏”导致误配。
+- **密钥管理现状**：AI `api_key` 由 UI 写入 `db.json` 持久化（仓库不提交真实密钥）。生产/共享环境建议使用环境变量或外部 Secret 管理方案替代明文落盘。
 
 ## 7. 阶段小结：LLDP 拓扑生成与交互（本次迭代）
 
@@ -73,3 +74,19 @@
 #### D. 可观测性与运维
 - **一键诊断**：在拓扑页显示“最近一次采集时间、成功/失败设备数、失败原因汇总”，并提供一键复制排障信息。
 - **端口占用提示**：前端启动端口冲突时给出明确指引（例如自动切换端口或提示释放占用）。
+
+## 8. 阶段小结：网络 AI 助手（Hermes-like Agent）
+### 8.1 已完成能力
+- **对话入口与设备范围选择**：在聊天输入区域即可选择“全部设备/指定设备”，节省用户重复描述范围。
+- **Plan → Act**：先输出结构化计划（plan），再进入执行；支持关闭“自动执行”进入逐步模式。
+- **步骤级执行状态机**：`planned/running/done/failed/skipped`，支持逐步执行与失败重试，并在时间线记录关键事件。
+- **工具调用与资产约束**：仅允许对资产库设备执行命令；越权 device_id 会被拒绝。
+- **Skill Hub（越用越聪明）**：成功验证后自动沉淀意图→命令；支持按品牌/意图关键字检索并复用。
+
+### 8.2 质量保障
+- **单元/集成测试**：覆盖 Agent 计划生成、权限闸门、步骤执行、未收敛兜底、范围约束、参数一致性校验等关键路径。
+- **可选 E2E 测试**：测试环境允许改设备配置，可验证真实设备接入与配置下发链路。
+
+## 9. 可移植性与发布
+- **Docker Compose 一条命令启动**：前端 Nginx 反代 `/api` 到后端；`db.json` 通过卷挂载持久化。
+- **开发模式（Windows/Linux）**：前后端分别启动；前端通过 `VITE_API_BASE` 指向后端 API。
