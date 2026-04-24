@@ -6,6 +6,28 @@
 
 前提：已安装 Docker Desktop（Windows）或 Docker Engine（Linux），并启用 `docker compose`。
 
+### 方式一：不手动下载源码（自动拉取仓库并启动）
+
+Linux/macOS/WSL：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tbagzhao668/SentineINET/main/install.sh | bash
+```
+
+Windows PowerShell：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/tbagzhao668/SentineINET/main/install.ps1 | iex"
+```
+
+默认会拉取 GitHub 仓库并启动容器；如需改为 Gitee，可在执行前设置环境变量：
+
+```bash
+REPO_URL="https://gitee.com/tisnzhao/SentinelNET.git" curl -fsSL https://raw.githubusercontent.com/tbagzhao668/SentineINET/main/install.sh | bash
+```
+
+### 方式二：已下载源码（本目录直接启动）
+
 ```bash
 docker compose up -d --build
 ```
