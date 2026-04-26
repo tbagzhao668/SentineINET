@@ -148,3 +148,41 @@ class AIAnalyzer:
         # 移除可能的 markdown 块
         content = content.replace("```", "").replace("```bash", "").strip()
         return [line.strip() for line in content.split('\n') if line.strip()]
+
+    def generate_backup_command_templates(self, brand, device_version=None, protocol="tftp", timeout_s=None):
+        version_text = (device_version or "").strip() or "未知"
+        p = (protocol or "").strip().lower() or "tftp"
+        system_prompt = f"""
+        你是一个精通各类网络设备/防火墙 CLI 的专家。
+        目标设备品牌：{brand}
+        目标设备版本信息：{version_text}
+        目标传输协议：{p}
+
+        任务：生成“备份当前运行配置到备份服务器”的命令模板（可用于定期自动备份）。
+
+        强制要求：
+        1) 输出必须为 JSON（json_object），只能包含 keys: commands, prerequisites, tags
+        2) commands 必须是字符串数组（1-6 条），每条是单行 CLI 命令，不要包含解释文字
+        3) 命令必须尽量做到非交互式（不要依赖输入确认/密码提示/文件名提示）
+        4) 不要写死真实 IP/用户名/密码/路径，必须使用占位符：
+           - {{server_ip}} 备份服务器IP
+           - {{remote_path}} 备份文件远端路径（包含文件名）
+           - {{filename}} 备份文件名
+           - {{backup_url}} 完整 URL（适用于 ftp/sftp，可能包含账号密码）
+        5) 若需要先保存当前配置，请包含必要的保存命令（同样要求非交互式或默认确认）
+        6) tags 必须包含 \"backup\" 和协议名（例如 \"tftp\"）
+        """
+
+        user_prompt = "请给出可执行的命令模板。"
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            timeout=timeout_s,
+        )
+
+        return json.loads(response.choices[0].message.content)

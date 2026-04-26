@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import asyncio
 import datetime
@@ -27,6 +27,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+async def root():
+    return {
+        "name": "SentinelAI API",
+        "status": "ok",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+    }
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
 
 # --- 数据模型 ---
 
@@ -56,6 +69,9 @@ class DeviceConfig(BaseModel):
     os_version: Optional[str] = None
     inspection_interval: int = 10 # 每个设备独立的巡检间隔（分钟）
     backup_server_id: Optional[str] = None # 关联的备份服务器 ID
+    backup_enabled: bool = False
+    backup_interval: int = 1440
+    backup_filename_prefix: Optional[str] = None
 
 class SkillEntry(BaseModel):
     id: str
@@ -65,7 +81,14 @@ class SkillEntry(BaseModel):
     commands: List[str]
     description: Optional[str] = None
     source: str = "ai" # "ai" 或 "user"
-    created_at: datetime.datetime = datetime.datetime.now()
+    tags: Optional[List[str]] = None
+    prerequisites: Optional[str] = None
+    validation: Optional[str] = None
+    sample_output: Optional[str] = None
+    verified: bool = False
+    last_verified_at: Optional[datetime.datetime] = None
+    created_at: datetime.datetime = Field(default_factory=datetime.datetime.now)
+    updated_at: Optional[datetime.datetime] = None
 
 class InspectionSettings(BaseModel):
     auto_inspect: bool
@@ -102,6 +125,8 @@ db = {
     "pending_actions": [],
     "policy_history": {}, # 存储已下发的策略历史: {host: [policy1, policy2, ...]}
     "backup_servers": {}, # 存储备份服务器: {id: BackupServer}
+    "backup_history": {}, # {device_id: [history_entry, ...]}
+    "last_backup": {},    # {device_id: datetime}
     "agent_sessions": {},
     "settings": {
         "auto_inspect": False,
@@ -111,6 +136,8 @@ db = {
 
 _PERSIST_PATH = Path(__file__).resolve().parent / "db.json"
 _PERSIST_LOCK = Lock()
+_BACKUP_RUNNING = set()
+_BACKUP_RUNNING_LOCK = Lock()
 
 def _to_jsonable(obj):
     if isinstance(obj, datetime.datetime):
@@ -138,6 +165,8 @@ def _serialize_persisted_state():
         "ai": ai,
         "skills": _to_jsonable(db.get("skills", [])),
         "backup_servers": _to_jsonable(db.get("backup_servers", {})),
+        "backup_history": _to_jsonable(db.get("backup_history", {})),
+        "last_backup": _to_jsonable(db.get("last_backup", {})),
         "agent_sessions": _to_jsonable(db.get("agent_sessions", {})),
         "settings": _to_jsonable(db.get("settings", {"auto_inspect": False, "enabled_devices": []})),
     }
@@ -181,6 +210,24 @@ def _load_persisted_state():
     if isinstance(backup_raw, dict):
         db["backup_servers"] = backup_raw
 
+    backup_history_raw = raw.get("backup_history", {}) or {}
+    if isinstance(backup_history_raw, dict):
+        db["backup_history"] = backup_history_raw
+
+    last_backup_raw = raw.get("last_backup", {}) or {}
+    if isinstance(last_backup_raw, dict):
+        parsed = {}
+        for device_id, ts in last_backup_raw.items():
+            if isinstance(ts, datetime.datetime):
+                parsed[str(device_id)] = ts
+                continue
+            if isinstance(ts, str) and ts.strip():
+                try:
+                    parsed[str(device_id)] = datetime.datetime.fromisoformat(ts.strip())
+                except Exception:
+                    continue
+        db["last_backup"] = parsed
+
     settings_raw = raw.get("settings", {}) or {}
     if isinstance(settings_raw, dict):
         db["settings"]["auto_inspect"] = bool(settings_raw.get("auto_inspect", False))
@@ -207,18 +254,45 @@ def _find_skill(intent: str, brand: str, device_version: Optional[str] = None):
                 return s
     return None
 
-def _upsert_skill(intent: str, brand: str, device_version: Optional[str], commands: List[str], description: str, source: str = "ai"):
+def _upsert_skill(
+    intent: str,
+    brand: str,
+    device_version: Optional[str],
+    commands: List[str],
+    description: str,
+    source: str = "ai",
+    tags: Optional[List[str]] = None,
+    prerequisites: Optional[str] = None,
+    validation: Optional[str] = None,
+    sample_output: Optional[str] = None,
+    verified: bool = False,
+):
+    now = datetime.datetime.now()
+    existing = _find_skill(intent=intent, brand=brand, device_version=device_version)
+    if existing is not None:
+        skill_id = existing.get("id") or f"skill_{uuid.uuid4().hex[:10]}_{brand.lower()}"
+        created_at = existing.get("created_at") or now
+    else:
+        skill_id = f"skill_{uuid.uuid4().hex[:10]}_{brand.lower()}"
+        created_at = now
+
     payload = {
-        "id": f"skill_{int(datetime.datetime.now().timestamp())}_{brand.lower()}",
+        "id": skill_id,
         "brand": brand,
         "device_version": _norm_text(device_version) or None,
         "intent": intent,
         "commands": commands,
         "description": description,
         "source": source,
-        "created_at": datetime.datetime.now(),
+        "tags": tags,
+        "prerequisites": prerequisites,
+        "validation": validation,
+        "sample_output": sample_output,
+        "verified": bool(verified),
+        "last_verified_at": (now if verified else existing.get("last_verified_at") if isinstance(existing, dict) else None),
+        "created_at": created_at,
+        "updated_at": now,
     }
-    existing = _find_skill(intent=intent, brand=brand, device_version=device_version)
     if existing is not None:
         existing.update(payload)
     else:
@@ -821,7 +895,17 @@ async def collect_cli_output(adapter: FirewallAdapter, analyzer: AIAnalyzer, int
             and (validation != "alarms" or _looks_like_alarm_logs(output))
             and (validation != "topology" or _looks_like_topology_output(output))
         ):
-            _upsert_skill(intent=intent, brand=brand, device_version=device_version, commands=commands, description=f"自动验证通过的 {intent} 指令集", source="ai")
+            _upsert_skill(
+                intent=intent,
+                brand=brand,
+                device_version=device_version,
+                commands=commands,
+                description=f"自动验证通过的 {intent} 指令集",
+                source="ai",
+                validation=validation,
+                sample_output=_truncate_text(output, 360),
+                verified=True,
+            )
         if validation in ("logs", "alarms", "topology"):
             failed = _output_indicates_command_error(output)
             if validation == "logs":
@@ -840,6 +924,207 @@ async def collect_cli_output(adapter: FirewallAdapter, analyzer: AIAnalyzer, int
 
 def _truncate_text(value: Optional[str], limit: int) -> str:
     return (value or "").replace("\r", "")[: max(0, int(limit or 0))]
+
+def _backup_intent(protocol: str) -> str:
+    p = (protocol or "").strip().lower() or "tftp"
+    return f"备份运行配置到{p}备份服务器"
+
+def _safe_path_join(base_path: str, name: str) -> str:
+    b = (base_path or "").strip() or "/"
+    n = (name or "").strip()
+    if not n:
+        return b
+    if b.endswith("/"):
+        return b + n.lstrip("/")
+    return b + "/" + n.lstrip("/")
+
+def _build_backup_filename(dev: DeviceConfig) -> str:
+    prefix = (getattr(dev, "backup_filename_prefix", None) or getattr(dev, "alias", None) or getattr(dev, "id", None) or "device").strip()
+    safe = re.sub(r"[^a-zA-Z0-9_.\-]+", "_", prefix)[:40] or "device"
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{safe}_{ts}.cfg"
+
+def _render_template(text: str, values: Dict[str, str]) -> str:
+    t = str(text or "")
+    if not t:
+        return ""
+    def repl(m):
+        k = m.group(1)
+        if k in values:
+            return str(values[k] or "")
+        return m.group(0)
+    return re.sub(r"\{([a-zA-Z0-9_]+)\}", repl, t)
+
+def _looks_like_backup_success(output: str) -> bool:
+    text = (output or "").replace("\r", "")
+    if _output_indicates_command_error(text):
+        return False
+    compact = " ".join([x.strip() for x in text.splitlines() if x.strip()])[:1200].lower()
+    if len(compact) < 16:
+        return False
+    tokens = [
+        "bytes copied",
+        "copy complete",
+        "copied",
+        "completed",
+        "complete",
+        "success",
+        "successful",
+        "transfer",
+        "tftp",
+        "ftp",
+        "sftp",
+        "scp",
+        "saved",
+        "writing",
+        "upload",
+    ]
+    return any(t in compact for t in tokens)
+
+async def run_device_backup(device_id: str, trigger: str = "manual", allow_ai: bool = True) -> Dict[str, Any]:
+    dev = db["devices"].get(device_id)
+    if dev is None:
+        raise HTTPException(status_code=404, detail="设备未找到")
+    backup_server_id = getattr(dev, "backup_server_id", None) or ""
+    server = db["backup_servers"].get(backup_server_id) if backup_server_id else None
+    if not isinstance(server, dict):
+        raise HTTPException(status_code=400, detail="该设备未关联备份服务器，请先在资产管理或备份中心配置")
+
+    with _BACKUP_RUNNING_LOCK:
+        if device_id in _BACKUP_RUNNING:
+            raise HTTPException(status_code=409, detail="该设备正在执行备份任务")
+        _BACKUP_RUNNING.add(device_id)
+
+    t0 = time.perf_counter()
+    try:
+        adapter = FirewallAdapter(dev.brand, dev.host, dev.username, dev.password, dev.port, dev.secret, dev.protocol)
+        ai_conf = db.get("ai")
+        analyzer = None
+        if ai_conf and getattr(ai_conf, "api_key", "").strip():
+            analyzer = AIAnalyzer(ai_conf.api_key, ai_conf.model, ai_conf.base_url)
+
+        version_tag = getattr(dev, "os_version", None) or await asyncio.to_thread(_detect_device_version, adapter, dev.brand)
+        if (not version_tag) and analyzer and allow_ai:
+            try:
+                version_tag = await asyncio.to_thread(_detect_device_version_with_ai, adapter, analyzer, dev.brand)
+            except Exception:
+                version_tag = None
+        if version_tag and version_tag != getattr(dev, "os_version", None):
+            dev.os_version = version_tag
+            await asyncio.to_thread(_save_persisted_state)
+
+        protocol = (server.get("protocol") or "tftp").strip().lower()
+        intent = _backup_intent(protocol)
+        existing = _find_skill(intent=intent, brand=dev.brand, device_version=version_tag)
+
+        filename = _build_backup_filename(dev)
+        remote_path = _safe_path_join(server.get("path") or "/", filename)
+        server_ip = (server.get("server_ip") or "").strip()
+        username = (server.get("username") or "").strip()
+        password = (server.get("password") or "").strip()
+        backup_url = ""
+        if protocol in ("ftp", "sftp"):
+            if username and password:
+                backup_url = f"{protocol}://{username}:{password}@{server_ip}{remote_path if remote_path.startswith('/') else '/' + remote_path}"
+            elif username:
+                backup_url = f"{protocol}://{username}@{server_ip}{remote_path if remote_path.startswith('/') else '/' + remote_path}"
+            else:
+                backup_url = f"{protocol}://{server_ip}{remote_path if remote_path.startswith('/') else '/' + remote_path}"
+
+        values = {
+            "server_ip": server_ip,
+            "protocol": protocol,
+            "username": username,
+            "password": password,
+            "path": (server.get("path") or "/").strip() or "/",
+            "remote_path": remote_path,
+            "filename": filename,
+            "device_id": str(getattr(dev, "id", "") or device_id),
+            "backup_url": backup_url,
+        }
+
+        used_ai = False
+        used_skill_id = existing.get("id") if isinstance(existing, dict) else None
+        if existing and isinstance(existing.get("commands"), list) and existing["commands"]:
+            templates = [str(x) for x in existing["commands"] if str(x).strip()]
+        else:
+            if not (analyzer and allow_ai):
+                raise HTTPException(status_code=400, detail="缺少可复用的备份 Skill，且未配置 AI（或 allow_ai=false）。")
+            used_ai = True
+            ai_payload = await asyncio.to_thread(analyzer.generate_backup_command_templates, dev.brand, version_tag, protocol)
+            templates = [str(x).strip() for x in (ai_payload.get("commands") or []) if str(x).strip()]
+            if not templates:
+                raise HTTPException(status_code=500, detail="AI 未返回可用的备份命令模板")
+            prerequisites = ai_payload.get("prerequisites") or ""
+            tags = ai_payload.get("tags") or ["backup", protocol]
+            used_skill_id = None
+
+        commands = [_render_template(t, values) for t in templates]
+        output = await asyncio.to_thread(adapter.execute_commands, commands)
+        ok = _looks_like_backup_success(output)
+        dt_ms = int((time.perf_counter() - t0) * 1000)
+
+        history_entry = {
+            "id": f"backup_{uuid.uuid4().hex[:10]}",
+            "time": datetime.datetime.now(),
+            "trigger": trigger,
+            "ok": bool(ok),
+            "device_id": device_id,
+            "brand": dev.brand,
+            "device_version": version_tag,
+            "backup_server_id": backup_server_id,
+            "protocol": protocol,
+            "remote_path": remote_path,
+            "used_ai": bool(used_ai),
+            "used_skill_id": used_skill_id,
+            "output": _truncate_text(output, 1200),
+            "dt_ms": dt_ms,
+        }
+        db.setdefault("backup_history", {})
+        db["backup_history"].setdefault(device_id, [])
+        db["backup_history"][device_id].append(history_entry)
+        db.setdefault("last_backup", {})
+        db["last_backup"][device_id] = datetime.datetime.now()
+
+        created_skill_id = None
+        if ok and used_ai:
+            desc = f"自动验证通过的 {intent} 指令模板（已支持占位符 server_ip/remote_path/backup_url/filename）"
+            _upsert_skill(
+                intent=intent,
+                brand=dev.brand,
+                device_version=version_tag,
+                commands=templates,
+                description=desc,
+                source="ai",
+                tags=tags,
+                prerequisites=prerequisites,
+                validation="backup",
+                sample_output=_truncate_text(output, 360),
+                verified=True,
+            )
+            saved = _find_skill(intent=intent, brand=dev.brand, device_version=version_tag)
+            if isinstance(saved, dict):
+                created_skill_id = saved.get("id")
+
+        await asyncio.to_thread(_save_persisted_state)
+
+        if not ok:
+            raise HTTPException(status_code=500, detail=f"备份命令已执行但未检测到成功特征。输出：{_truncate_text(output, 280)}")
+
+        return {
+            "ok": True,
+            "device_id": device_id,
+            "backup_server_id": backup_server_id,
+            "protocol": protocol,
+            "remote_path": remote_path,
+            "used_ai": used_ai,
+            "used_skill_id": used_skill_id,
+            "created_skill_id": created_skill_id,
+            "dt_ms": dt_ms,
+        }
+    finally:
+        with _BACKUP_RUNNING_LOCK:
+            _BACKUP_RUNNING.discard(device_id)
 
 def _extract_prompt_name(output: str) -> Optional[str]:
     text = (output or "").replace("\r", "")
@@ -923,6 +1208,7 @@ def _fallback_topology_from_payload(payload: List[Dict[str, Any]]) -> Dict[str, 
             "brand": p.get("brand"),
             "host": p.get("host"),
             "device_id": p.get("device_id"),
+            "collected_at": p.get("collected_at"),
         }
         node_map[node_id] = node
 
@@ -944,6 +1230,11 @@ def _fallback_topology_from_payload(payload: List[Dict[str, Any]]) -> Dict[str, 
                 node_map[target_id] = {"id": target_id, "label": neigh_label}
             local_port = e.get("local_port") or ""
             remote_port = e.get("remote_port") or ""
+            expires_s = None
+            try:
+                expires_s = int(e.get("expires")) if e.get("expires") is not None else None
+            except Exception:
+                expires_s = None
             a, b = (source_id, target_id) if source_id <= target_id else (target_id, source_id)
             a_port, b_port = (local_port, remote_port) if source_id == a else (remote_port, local_port)
             link_key = (a, b, a_port, b_port, "lldp")
@@ -957,6 +1248,7 @@ def _fallback_topology_from_payload(payload: List[Dict[str, Any]]) -> Dict[str, 
                     "local_port": a_port or None,
                     "remote_port": b_port or None,
                     "protocol": "lldp",
+                    "expires_s": expires_s,
                 }
             )
 
@@ -1111,6 +1403,9 @@ async def collect_topology_cli_output_with_debug(adapter: FirewallAdapter, analy
                     commands=[cmd],
                     description=f"自动验证通过的 {intent} 指令集",
                     source="ai",
+                    validation="topology",
+                    sample_output=_truncate_text(output, 360),
+                    verified=True,
                 )
                 return output, {"used_commands": [cmd], "attempts": attempts}
         except asyncio.CancelledError:
@@ -1148,6 +1443,9 @@ async def collect_topology_cli_output_with_debug(adapter: FirewallAdapter, analy
                     commands=commands,
                     description=f"自动验证通过的 {intent} 指令集",
                     source="ai",
+                    validation="topology",
+                    sample_output=_truncate_text(output, 360),
+                    verified=True,
                 )
                 return output, {"used_commands": commands, "attempts": attempts}
 
@@ -1174,6 +1472,9 @@ async def collect_topology_cli_output_with_debug(adapter: FirewallAdapter, analy
                         commands=retry_commands,
                         description=f"自动验证通过的 {intent} 指令集",
                         source="ai",
+                        validation="topology",
+                        sample_output=_truncate_text(retry_output, 360),
+                        verified=True,
                     )
                     return retry_output, {"used_commands": retry_commands, "attempts": attempts}
         except asyncio.CancelledError:
@@ -1333,11 +1634,46 @@ async def inspection_scheduler():
                     asyncio.create_task(run_device_inspection(device_id))
         await asyncio.sleep(60)
 
+async def backup_scheduler():
+    while True:
+        now = datetime.datetime.now()
+        for device_id, dev in db["devices"].items():
+            try:
+                if not getattr(dev, "backup_enabled", False):
+                    continue
+                interval_min = int(getattr(dev, "backup_interval", 0) or 0)
+                if interval_min <= 0:
+                    continue
+                server_id = (getattr(dev, "backup_server_id", None) or "").strip()
+                if not server_id:
+                    continue
+                server = db["backup_servers"].get(server_id)
+                protocol = (server.get("protocol") if isinstance(server, dict) else None) or ""
+                intent = _backup_intent(protocol or "tftp")
+                existing = _find_skill(intent=intent, brand=getattr(dev, "brand", "") or "", device_version=getattr(dev, "os_version", None))
+                ai_conf = db.get("ai")
+                has_ai = bool(ai_conf and getattr(ai_conf, "api_key", "").strip())
+                if (not existing) and (not has_ai):
+                    continue
+                last_time = db.get("last_backup", {}).get(device_id)
+                due = (last_time is None) or ((now - last_time).total_seconds() >= interval_min * 60)
+                if due:
+                    async def _runner(did: str):
+                        try:
+                            await run_device_backup(did, trigger="schedule", allow_ai=True)
+                        except Exception:
+                            return
+                    asyncio.create_task(_runner(device_id))
+            except Exception:
+                continue
+        await asyncio.sleep(60)
+
 @app.on_event("startup")
 async def startup_event():
     _load_persisted_state()
     asyncio.create_task(inspection_scheduler())
     asyncio.create_task(connectivity_monitor())
+    asyncio.create_task(backup_scheduler())
 
 # --- API 路由 ---
 
@@ -1365,6 +1701,43 @@ async def remove_backup_server(server_id: str):
         await asyncio.to_thread(_save_persisted_state)
         return {"message": "备份服务器已移除"}
     raise HTTPException(status_code=404, detail="服务器未找到")
+
+@app.get("/backup/status")
+async def get_backup_status():
+    items = []
+    for device_id, dev in db["devices"].items():
+        server_id = (getattr(dev, "backup_server_id", None) or "").strip()
+        server = db["backup_servers"].get(server_id) if server_id else None
+        protocol = (server.get("protocol") if isinstance(server, dict) else None) or ""
+        last_time = db.get("last_backup", {}).get(device_id)
+        interval_min = int(getattr(dev, "backup_interval", 0) or 0)
+        next_run = None
+        if isinstance(last_time, datetime.datetime) and interval_min > 0:
+            next_run = last_time + datetime.timedelta(minutes=interval_min)
+        items.append(
+            {
+                "device_id": device_id,
+                "alias": getattr(dev, "alias", None),
+                "brand": getattr(dev, "brand", None),
+                "device_version": getattr(dev, "os_version", None),
+                "backup_enabled": bool(getattr(dev, "backup_enabled", False)),
+                "backup_interval": interval_min,
+                "backup_server_id": server_id,
+                "backup_protocol": protocol,
+                "last_backup": last_time,
+                "next_backup": next_run,
+            }
+        )
+    return items
+
+@app.get("/backup/history/{device_id}")
+async def get_backup_history(device_id: str):
+    items = db.get("backup_history", {}).get(device_id, []) or []
+    return items[-50:]
+
+@app.post("/backup/run/{device_id}")
+async def run_backup_now(device_id: str):
+    return await run_device_backup(device_id, trigger="manual", allow_ai=True)
 
 @app.get("/config/ai/models")
 async def get_ai_models():
@@ -1407,6 +1780,11 @@ async def get_all_devices_status():
     stats = {}
     for device_id, dev in db["devices"].items():
         inspection = db["inspections"].get(device_id, {"status": "unknown"})
+        last_backup = db.get("last_backup", {}).get(device_id)
+        backup_interval = int(getattr(dev, "backup_interval", 0) or 0)
+        next_backup = None
+        if isinstance(last_backup, datetime.datetime) and backup_interval > 0:
+            next_backup = last_backup + datetime.timedelta(minutes=backup_interval)
         stats[device_id] = {
             "id": device_id,
             "host": dev.host,
@@ -1419,6 +1797,11 @@ async def get_all_devices_status():
             "last_run": db["last_run"].get(device_id),
             "policy_count": len(db["policy_history"].get(device_id, [])),
             "inspection_interval": dev.inspection_interval,
+            "backup_enabled": bool(getattr(dev, "backup_enabled", False)),
+            "backup_interval": backup_interval,
+            "backup_server_id": getattr(dev, "backup_server_id", None),
+            "last_backup": last_backup,
+            "next_backup": next_backup,
             "is_enabled": (not enabled_set) or (device_id in enabled_set) or (dev.host in enabled_set)
         }
     return stats
@@ -1596,6 +1979,7 @@ async def generate_topology(
 ):
     request_id = uuid.uuid4().hex[:10]
     t0 = time.perf_counter()
+    generated_at = datetime.datetime.now().isoformat()
     topology_logger.info("topology.generate start request_id=%s scope=%s debug=%s use_ai=%s", request_id, scope, debug, use_ai)
     analyzer = None
     if use_ai:
@@ -1654,6 +2038,7 @@ async def generate_topology(
             "os_version": dev.os_version,
             "lldp_output": "",
             "error": None,
+            "collected_at": datetime.datetime.now().isoformat(),
         }
         try:
             async with sem:
@@ -1790,11 +2175,15 @@ async def generate_topology(
             "os_version": p.get("os_version"),
             "lldp_output": p.get("lldp_output"),
             "error": p.get("error"),
+            "collected_at": p.get("collected_at"),
         }
         for p in collected
     ]
 
     base_result = _fallback_topology_from_payload(payload)
+    if isinstance(base_result, dict):
+        base_result["generated_at"] = generated_at
+        base_result["request_id"] = request_id
     if debug:
         base_result["debug"] = {
             "devices": collected,
@@ -1872,6 +2261,7 @@ def _looks_readonly_command(cmd: str) -> bool:
         "show ",
         "display ",
         "get ",
+        "diagnose ",
         "ping ",
         "traceroute ",
         "tracert ",
@@ -1898,19 +2288,22 @@ def _looks_dangerous_command(cmd: str) -> bool:
     c = (cmd or "").strip().lower()
     if not c:
         return False
-    deny = (
-        "format",
-        "delete",
-        "erase",
-        "reboot",
-        "reload",
-        "reset",
-        "restore",
-        "shutdown",
-        "write erase",
-        "factory",
-    )
-    return any(x in c for x in deny)
+    patterns = [
+        r"\bformat\b",
+        r"\bdelete\b",
+        r"\berase\b",
+        r"\breboot\b",
+        r"\breload\b",
+        r"\bshutdown\b",
+        r"\bfactory\b",
+        r"\bfactory\s+reset\b",
+        r"\bwrite\s+erase\b",
+        r"\breset\s+saved-configuration\b",
+        r"\bclear\s+configuration\b",
+        r"\berase\s+startup-config\b",
+        r"\bdelete\s+/force\b",
+    ]
+    return any(re.search(p, c) for p in patterns)
 
 def _agent_now_iso() -> str:
     return datetime.datetime.now().isoformat()
@@ -2140,6 +2533,7 @@ async def agent_run_step(req: AgentRunStepRequest):
     if step.get("status") not in ("pending", "failed"):
         return {"session_id": session.get("id"), "run": run, "events": session.get("events") or []}
 
+    step_t0 = time.perf_counter()
     step["status"] = "running"
     step["started_at"] = _agent_now_iso()
     run["status"] = "running"
@@ -2179,22 +2573,22 @@ async def agent_run_step(req: AgentRunStepRequest):
 
     async def _tool_run_device_commands(device_id: str, commands: List[str]):
         if str(device_id) not in set(allowed_ids):
-            raise ValueError("device_id 不在允许列表中")
+            raise ValueError("DENY_DEVICE: device_id 不在允许列表中")
         if not bool(session.get("allow_config")):
             for c in commands:
                 if not _looks_readonly_command(c):
-                    raise ValueError("当前会话未开启配置下发（allow_config=false），仅允许只读命令")
+                    raise ValueError("DENY_READONLY: 当前会话未开启配置下发（allow_config=false），仅允许只读命令")
         else:
             for c in commands:
                 if _looks_dangerous_command(c):
-                    raise ValueError("检测到高风险命令，已拒绝执行")
+                    raise ValueError("DENY_DANGEROUS: 检测到高风险命令，已拒绝执行")
             err = _agent_validate_step_commands(step_text, commands)
             if err:
-                raise ValueError(err)
+                raise ValueError(f"PARAM_MISMATCH: {err}")
 
         dev = db["devices"].get(device_id)
         if dev is None:
-            raise ValueError("设备不存在")
+            raise ValueError("NOT_FOUND: 设备不存在")
         adapter = FirewallAdapter(dev.brand, dev.host, dev.username, dev.password, dev.port, dev.secret, dev.protocol)
         out = await asyncio.to_thread(adapter.execute_commands, commands)
         return {"device_id": device_id, "commands": commands, "output": _truncate_text(out or "", 6000)}
@@ -2260,10 +2654,11 @@ async def agent_run_step(req: AgentRunStepRequest):
                 continue
 
             summary = msg.content or ""
+            step_dt_ms = int((time.perf_counter() - step_t0) * 1000)
             if last_tool_ok is False:
                 step["status"] = "failed"
                 summary = f"步骤执行失败：{(last_tool_error or '未知错误')}"
-                _agent_add_event(session, "step_failed", {"run_id": run.get("id"), "step_index": idx, "error": (last_tool_error or "")[:240]})
+                _agent_add_event(session, "step_failed", {"run_id": run.get("id"), "step_index": idx, "dt_ms": step_dt_ms, "error": (last_tool_error or "")[:240]})
             else:
                 step["status"] = "done"
             step["ended_at"] = _agent_now_iso()
@@ -2271,7 +2666,7 @@ async def agent_run_step(req: AgentRunStepRequest):
             step["tool_log"] = tool_calls_log
             run["updated_at"] = _agent_now_iso()
             if step["status"] == "done":
-                _agent_add_event(session, "step_done", {"run_id": run.get("id"), "step_index": idx})
+                _agent_add_event(session, "step_done", {"run_id": run.get("id"), "step_index": idx, "dt_ms": step_dt_ms})
             try:
                 loop = asyncio.get_running_loop()
                 loop.create_task(asyncio.to_thread(_save_persisted_state))
@@ -2281,12 +2676,16 @@ async def agent_run_step(req: AgentRunStepRequest):
 
         raise RuntimeError("步骤执行未能收敛")
     except Exception as e:
+        step_dt_ms = int((time.perf_counter() - step_t0) * 1000) if "step_t0" in locals() else None
         step["status"] = "failed"
         step["ended_at"] = _agent_now_iso()
         step["summary"] = f"步骤执行失败：{str(e)[:240]}"
         step["tool_log"] = tool_calls_log
         run["updated_at"] = _agent_now_iso()
-        _agent_add_event(session, "step_failed", {"run_id": run.get("id"), "step_index": idx, "error": str(e)[:240]})
+        payload = {"run_id": run.get("id"), "step_index": idx, "error": str(e)[:240]}
+        if isinstance(step_dt_ms, int):
+            payload["dt_ms"] = step_dt_ms
+        _agent_add_event(session, "step_failed", payload)
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(asyncio.to_thread(_save_persisted_state))
@@ -2411,6 +2810,11 @@ async def agent_chat(req: AgentChatRequest):
                         "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                         "description": {"type": "string"},
                         "source": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "prerequisites": {"type": "string"},
+                        "validation": {"type": "string"},
+                        "sample_output": {"type": "string"},
+                        "verified": {"type": "boolean"},
                     },
                     "required": ["brand", "intent", "commands"],
                     "additionalProperties": False,
@@ -2428,33 +2832,53 @@ async def agent_chat(req: AgentChatRequest):
     def _tool_list_skills(brand: Optional[str] = None, intent_contains: Optional[str] = None):
         items = db.get("skills", []) or []
         b = (brand or "").strip()
-        kw = (intent_contains or "").strip()
+        kw = (intent_contains or "").strip().lower()
         if b:
             items = [s for s in items if (s.get("brand") or "").strip().lower() == b.lower()]
         if kw:
-            items = [s for s in items if kw in (s.get("intent") or "")]
+            items = [s for s in items if kw in ((s.get("intent") or "").lower())]
         return {"skills": items[:50]}
 
     async def _tool_run_device_commands(device_id: str, commands: List[str]):
         if str(device_id) not in set(allowed_ids):
-            raise ValueError("device_id 不在允许列表中")
+            raise ValueError("DENY_DEVICE: device_id 不在允许列表中")
         if not req.allow_config:
             for c in commands:
                 if not _looks_readonly_command(c):
-                    raise ValueError("当前会话未开启配置下发（allow_config=false），仅允许只读命令")
+                    raise ValueError("DENY_READONLY: 当前会话未开启配置下发（allow_config=false），仅允许只读命令")
         else:
             for c in commands:
                 if _looks_dangerous_command(c):
-                    raise ValueError("检测到高风险命令（format/delete/erase/reboot/reset/restore/shutdown 等），已拒绝执行")
+                    raise ValueError("DENY_DANGEROUS: 检测到高风险命令，已拒绝执行")
 
         dev = db["devices"].get(device_id)
         if dev is None:
-            raise ValueError("设备不存在")
+            raise ValueError("NOT_FOUND: 设备不存在")
 
         adapter = FirewallAdapter(dev.brand, dev.host, dev.username, dev.password, dev.port, dev.secret, dev.protocol)
-        _agent_add_event(session, "tool_start", {"tool": "run_device_commands", "device_id": device_id, "commands": [str(x) for x in (commands or [])][:20]})
-        output = await asyncio.to_thread(adapter.execute_commands, commands)
-        _agent_add_event(session, "tool_end", {"tool": "run_device_commands", "device_id": device_id, "ok": True})
+        cmds_safe = [str(x) for x in (commands or [])][:20]
+        _agent_add_event(session, "tool_start", {"tool": "run_device_commands", "device_id": device_id, "commands": cmds_safe})
+        t0 = time.perf_counter()
+        try:
+            output = await asyncio.to_thread(adapter.execute_commands, commands)
+            _agent_add_event(
+                session,
+                "tool_end",
+                {"tool": "run_device_commands", "device_id": device_id, "ok": True, "dt_ms": int((time.perf_counter() - t0) * 1000)},
+            )
+        except Exception as e:
+            _agent_add_event(
+                session,
+                "tool_end",
+                {
+                    "tool": "run_device_commands",
+                    "device_id": device_id,
+                    "ok": False,
+                    "dt_ms": int((time.perf_counter() - t0) * 1000),
+                    "error": str(e)[:240],
+                },
+            )
+            raise
         return {
             "device_id": device_id,
             "brand": dev.brand,
@@ -2463,8 +2887,32 @@ async def agent_chat(req: AgentChatRequest):
             "output": _truncate_text(output or "", 8000),
         }
 
-    def _tool_save_skill(brand: str, intent: str, commands: List[str], device_version: Optional[str] = None, description: str = "", source: str = "ai"):
-        _upsert_skill(intent=intent, brand=brand, device_version=device_version, commands=commands, description=description or "", source=source or "ai")
+    def _tool_save_skill(
+        brand: str,
+        intent: str,
+        commands: List[str],
+        device_version: Optional[str] = None,
+        description: str = "",
+        source: str = "ai",
+        tags: Optional[List[str]] = None,
+        prerequisites: Optional[str] = None,
+        validation: Optional[str] = None,
+        sample_output: Optional[str] = None,
+        verified: bool = False,
+    ):
+        _upsert_skill(
+            intent=intent,
+            brand=brand,
+            device_version=device_version,
+            commands=commands,
+            description=description or "",
+            source=source or "ai",
+            tags=tags,
+            prerequisites=prerequisites,
+            validation=validation,
+            sample_output=_truncate_text(sample_output, 360) if sample_output else None,
+            verified=bool(verified),
+        )
         existing = _find_skill(intent=intent, brand=brand, device_version=device_version)
         skill_id = existing.get("id") if isinstance(existing, dict) else None
         if skill_id:
@@ -2578,6 +3026,11 @@ async def agent_chat(req: AgentChatRequest):
                             commands=args.get("commands") or [],
                             description=args.get("description") or "",
                             source=args.get("source") or "ai",
+                            tags=args.get("tags"),
+                            prerequisites=args.get("prerequisites"),
+                            validation=args.get("validation"),
+                            sample_output=args.get("sample_output"),
+                            verified=bool(args.get("verified") or False),
                         )
                     else:
                         raise ValueError("未知工具")

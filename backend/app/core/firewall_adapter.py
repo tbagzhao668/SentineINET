@@ -178,30 +178,43 @@ class FirewallAdapter:
             if (not username) and (not password):
                 return self._execute_telnet_noauth(commands)
 
-        with self._connect() as conn:
-            if is_config:
-                if hasattr(conn, "enable"):
-                    conn.enable()
-                return conn.send_config_set(commands)
-            else:
-                results = []
-                for cmd in commands:
-                    if self.protocol == "telnet":
-                        if hasattr(conn, "send_command_timing"):
-                            results.append(
-                                conn.send_command_timing(
-                                    cmd,
-                                    strip_prompt=False,
-                                    strip_command=False,
-                                    delay_factor=2,
-                                    max_loops=200,
+        last_err = None
+        for attempt in range(2):
+            try:
+                with self._connect() as conn:
+                    if is_config:
+                        if hasattr(conn, "enable"):
+                            conn.enable()
+                        return conn.send_config_set(commands)
+                    results = []
+                    for cmd in commands:
+                        if self.protocol == "telnet":
+                            if hasattr(conn, "send_command_timing"):
+                                results.append(
+                                    conn.send_command_timing(
+                                        cmd,
+                                        strip_prompt=False,
+                                        strip_command=False,
+                                        delay_factor=2,
+                                        max_loops=200,
+                                    )
                                 )
-                            )
+                            else:
+                                results.append(conn.send_command(cmd, cmd_verify=False, read_timeout=30))
                         else:
                             results.append(conn.send_command(cmd, cmd_verify=False, read_timeout=30))
-                    else:
-                        results.append(conn.send_command(cmd, cmd_verify=False, read_timeout=30))
-                return "\n".join(results)
+                    return "\n".join(results)
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                retryable = any(x in msg for x in ["timed out", "timeout", "eof", "socket", "connection reset", "not responding", "reset by peer"])
+                if (attempt == 0) and retryable:
+                    time.sleep(0.6)
+                    continue
+                raise
+        if last_err:
+            raise last_err
+        return ""
 
     def _execute_telnet_noauth(self, commands):
         host = self.connection_params.get("host")
@@ -211,7 +224,25 @@ class FirewallAdapter:
 
         from netmiko._telnetlib.telnetlib import Telnet
 
-        def _read_idle(tn: Telnet, timeout_s: float, idle_s: float) -> bytes:
+        prompt_re = re.compile(r"(?m)^\s*[<\[]?[A-Za-z0-9_.:\-]{1,64}[\]>#]\s*$")
+        more_re = re.compile(r"(?i)(--more--|----\s*more\s*----|press\s+q|press\s+space|q\s+to\s+quit)")
+
+        def _tail_text(buf: bytes, max_bytes: int = 5000) -> str:
+            return (buf[-max_bytes:] if len(buf) > max_bytes else buf).decode(errors="ignore")
+
+        def _has_prompt(buf: bytes) -> bool:
+            t = _tail_text(buf)
+            lines = [x.strip() for x in t.replace("\r", "\n").split("\n") if x.strip()]
+            if not lines:
+                return False
+            last = lines[-1]
+            if prompt_re.search(last):
+                return True
+            if last.endswith(("#", ">", "]")):
+                return True
+            return False
+
+        def _read_until_prompt_or_idle(tn: Telnet, timeout_s: float, idle_s: float) -> bytes:
             buf = b""
             t0 = time.time()
             last_rx = None
@@ -220,9 +251,19 @@ class FirewallAdapter:
                     chunk = tn.read_very_eager()
                 except Exception:
                     chunk = b""
+
                 if chunk:
                     buf += chunk
                     last_rx = time.time()
+                    tail = _tail_text(buf)
+                    if more_re.search(tail):
+                        try:
+                            tn.write(b" ")
+                        except Exception:
+                            pass
+                    if _has_prompt(buf):
+                        if last_rx is not None and (time.time() - last_rx) >= 0.15:
+                            break
                 else:
                     if last_rx is not None and (time.time() - last_rx) >= idle_s:
                         break
@@ -233,10 +274,28 @@ class FirewallAdapter:
         try:
             tn = Telnet(host, port, timeout=3)
             tn.write(b"\r\n")
-            banner = _read_idle(tn, 2.5, 0.5)
+            banner = _read_until_prompt_or_idle(tn, 3.5, 0.6)
             text = banner.decode(errors="ignore")
             if re.search(r"(?i)(user|username|login|账号|帐号|用户名|用户)\s*[:：]", text) or re.search(r"(?i)(pass|password|passwd|口令|密码)\s*[:：]", text):
                 raise RuntimeError(f"Telnet 端口需要登录交互（检测到登录提示），请在资产里填写用户名/密码后再试。提示片段：{text.strip()[:120]}")
+
+            paging_cmd = None
+            if self.brand == "Huawei":
+                paging_cmd = "screen-length 0 temporary"
+            elif self.brand == "H3C":
+                paging_cmd = "screen-length disable"
+            elif self.brand == "Cisco":
+                paging_cmd = "terminal length 0"
+            elif self.brand == "Ruijie":
+                paging_cmd = "terminal length 0"
+            elif self.brand == "HP":
+                paging_cmd = "no page"
+            if paging_cmd:
+                try:
+                    tn.write(paging_cmd.encode("utf-8", errors="ignore") + b"\r\n")
+                    _read_until_prompt_or_idle(tn, 4.0, 0.8)
+                except Exception:
+                    pass
 
             results = []
             for cmd in commands:
@@ -244,7 +303,7 @@ class FirewallAdapter:
                 if not cmd:
                     continue
                 tn.write(cmd.encode("utf-8", errors="ignore") + b"\r\n")
-                out = _read_idle(tn, 9.0, 0.8)
+                out = _read_until_prompt_or_idle(tn, 14.0, 1.0)
                 results.append(out.decode(errors="ignore"))
             return "\n".join(results)
         finally:

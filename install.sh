@@ -47,6 +47,30 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
+port_in_use() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"$port" -sTCP:LISTEN -P -n >/dev/null 2>&1
+    return $?
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -E "[:.]${port}\$" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -an 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | grep -E "LISTEN|LISTENING" >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
+for p in 5175 8000; do
+  if port_in_use "$p"; then
+    echo "Port ${p} is already in use. Please stop the process using it, or change ports in docker-compose.yml." >&2
+    exit 1
+  fi
+done
+
 if [[ -d "$TARGET_DIR/.git" ]]; then
   echo "Updating existing repo: $TARGET_DIR"
   git -C "$TARGET_DIR" fetch --all --prune
@@ -72,3 +96,12 @@ echo
 echo "Done."
 echo "- Frontend: http://127.0.0.1:5175"
 echo "- Backend:  http://127.0.0.1:8000"
+echo
+echo "Common commands:"
+echo "- View status: docker compose ps"
+echo "- View logs:   docker compose logs -f --tail=200"
+echo "- Stop:        docker compose down"
+echo
+echo "First-time setup:"
+echo "- Open Frontend, then fill AI config (api_key/model/base_url) if you need AI features."
+echo "- Add devices in Asset Management (or edit backend/app/db.json in test environment)."

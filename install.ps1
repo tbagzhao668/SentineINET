@@ -23,6 +23,34 @@ function Assert-CommandExists {
 Assert-CommandExists "git"
 Assert-CommandExists "docker"
 
+function Test-PortInUse {
+  param([Parameter(Mandatory=$true)][int] $Port)
+  $hasGetNet = $false
+  try {
+    $null = Get-Command Get-NetTCPConnection -ErrorAction Stop
+    $hasGetNet = $true
+  } catch {
+    $hasGetNet = $false
+  }
+
+  if ($hasGetNet) {
+    $c = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
+    return ($null -ne $c)
+  }
+
+  $lines = netstat -ano -p tcp | Select-String -Pattern "LISTENING" -SimpleMatch
+  foreach ($l in $lines) {
+    if ($l.Line -match "[:.]$Port\s+LISTENING\s+(\d+)\s*$") { return $true }
+  }
+  return $false
+}
+
+foreach ($p in @(5175, 8000)) {
+  if (Test-PortInUse -Port $p) {
+    throw "Port $p is already in use. Please stop the process using it, or change ports in docker-compose.yml."
+  }
+}
+
 $composeOk = $false
 try {
   docker compose version | Out-Null
@@ -62,3 +90,12 @@ Write-Host ""
 Write-Host "Done."
 Write-Host "- Frontend: http://127.0.0.1:5175"
 Write-Host "- Backend:  http://127.0.0.1:8000"
+Write-Host ""
+Write-Host "Common commands:"
+Write-Host "- View status: docker compose ps"
+Write-Host "- View logs:   docker compose logs -f --tail=200"
+Write-Host "- Stop:        docker compose down"
+Write-Host ""
+Write-Host "First-time setup:"
+Write-Host "- Open Frontend, then fill AI config (api_key/model/base_url) if you need AI features."
+Write-Host "- Add devices in Asset Management (or edit backend/app/db.json in test environment)."

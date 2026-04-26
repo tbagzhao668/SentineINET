@@ -29,7 +29,7 @@ const App = () => {
   const [analysisMode, setAnalysisMode] = useState("security");
   const [topologyScope, setTopologyScope] = useState("enabled");
   const [topologyLoading, setTopologyLoading] = useState(false);
-  const [topology, setTopology] = useState({ nodes: [], links: [], summary: "" });
+  const [topology, setTopology] = useState({ nodes: [], links: [], summary: "", generated_at: "" });
   const [topologyError, setTopologyError] = useState("");
   const topologySvgRef = useRef(null);
   const topologyLayoutSizeRef = useRef({ w: 0, h: 0 });
@@ -71,7 +71,7 @@ const App = () => {
   const [skillPageSize, setSkillPageSize] = useState(8);
 
   // 表单暂存状态
-  const [newDevice, setNewDevice] = useState({ brand: "Cisco", host: "", port: 22, protocol: "ssh", alias: "", username: "", password: "", inspection_interval: 10, backup_server_id: "" });
+  const [newDevice, setNewDevice] = useState({ brand: "Cisco", host: "", port: 22, protocol: "ssh", alias: "", username: "", password: "", inspection_interval: 10, backup_server_id: "", backup_enabled: false, backup_interval: 1440, backup_filename_prefix: "" });
   const [newSkill, setNewSkill] = useState({ brand: "Cisco", device_version: "", intent: "", commands: "", description: "" });
   const [newBackupServer, setNewBackupServer] = useState({ id: "", server_ip: "", protocol: "tftp", username: "", password: "", path: "/" });
 
@@ -321,7 +321,7 @@ const App = () => {
         return;
       }
       await axios.post(`${API_BASE}/devices`, newDevice);
-      setNewDevice({ brand: "Cisco", host: "", port: 22, protocol: "ssh", alias: "", username: "", password: "", inspection_interval: 10, backup_server_id: "" });
+      setNewDevice({ brand: "Cisco", host: "", port: 22, protocol: "ssh", alias: "", username: "", password: "", inspection_interval: 10, backup_server_id: "", backup_enabled: false, backup_interval: 1440, backup_filename_prefix: "" });
       fetchInitialData();
       alert("设备添加成功");
     } catch (e) {
@@ -349,6 +349,30 @@ const App = () => {
       await axios.post(`${API_BASE}/devices`, updatedDevice);
       fetchInitialData();
     } catch (e) { alert("更新间隔失败"); }
+  };
+
+  const handleUpdateDeviceBackup = async (device, patch) => {
+    try {
+      const updatedDevice = { ...device, ...patch };
+      await axios.post(`${API_BASE}/devices`, updatedDevice);
+      await fetchInitialData();
+      await fetchDeviceStatuses();
+    } catch (e) {
+      const detail = e?.response?.data?.detail || e?.message || "未知错误";
+      alert("更新备份配置失败: " + detail);
+    }
+  };
+
+  const handleRunBackup = async (deviceId) => {
+    try {
+      await axios.post(`${API_BASE}/backup/run/${encodeURIComponent(deviceId)}`);
+      await fetchDeviceStatuses();
+      await fetchSkills();
+      alert("备份已触发（成功后会自动沉淀备份 Skill）");
+    } catch (e) {
+      const detail = e?.response?.data?.detail || e?.message || "未知错误";
+      alert("备份失败: " + detail);
+    }
   };
 
   const handleDeleteDevice = async (deviceId) => {
@@ -415,16 +439,12 @@ const App = () => {
 
   const handleGenerateTopology = async (options = {}) => {
     const silent = !!options?.silent;
-    if (!globalAi?.api_key?.trim()) {
-      if (!silent) alert("请先在 AI 配置中填写 API Key，再生成拓扑");
-      return;
-    }
     setTopologyLoading(true);
     try {
       const response = await axios.get(`${API_BASE}/topology/generate?scope=${encodeURIComponent(topologyScope)}`);
       const nodes = Array.isArray(response.data?.nodes) ? response.data.nodes : [];
       const links = Array.isArray(response.data?.links) ? response.data.links : [];
-      setTopology({ nodes, links, summary: response.data?.summary || "" });
+      setTopology({ nodes, links, summary: response.data?.summary || "", generated_at: response.data?.generated_at || "" });
       setTopologyError("");
       fetchSkills();
     } catch (error) {
@@ -549,7 +569,7 @@ const App = () => {
     const getPos = (id) => positions[nodeIndex.get(String(id))];
 
     const linkPairs = links
-      .map(l => ({ s: String(l?.source ?? ""), t: String(l?.target ?? ""), local_port: l?.local_port, remote_port: l?.remote_port }))
+      .map(l => ({ s: String(l?.source ?? ""), t: String(l?.target ?? ""), local_port: l?.local_port, remote_port: l?.remote_port, expires_s: l?.expires_s, protocol: l?.protocol }))
       .filter(l => nodeIndex.has(l.s) && nodeIndex.has(l.t) && l.s !== l.t);
 
     const n = positions.length;
@@ -1096,7 +1116,7 @@ const App = () => {
                     {topologyError ? (
                       <span className="text-red-400">拓扑生成失败：{topologyError}</span>
                     ) : (
-                      topology?.summary || `节点 ${topologyLayout.nodes.length} · 链路 ${topologyLayout.links.length}`
+                      `${topology?.summary || `节点 ${topologyLayout.nodes.length} · 链路 ${topologyLayout.links.length}`}${topology?.generated_at ? ` · 更新时间 ${new Date(topology.generated_at).toLocaleString()}` : ""}`
                     )}
                   </div>
                 </div>
@@ -1119,17 +1139,35 @@ const App = () => {
                     onMouseDown={startTopologyPan}
                     style={{ cursor: topologyDragMode === "pan" ? "grabbing" : "grab" }}
                   >
-                    {topologyLayout.links.map((l, idx) => (
-                      <line
-                        key={`${l.s}-${l.t}-${idx}`}
-                        x1={l.x1}
-                        y1={l.y1}
-                        x2={l.x2}
-                        y2={l.y2}
-                        stroke="rgba(148,163,184,0.35)"
-                        strokeWidth="1.5"
-                      />
-                    ))}
+                    {topologyLayout.links.map((l, idx) => {
+                      const nowMs = Date.now();
+                      const genMs = topology?.generated_at ? Date.parse(topology.generated_at) : NaN;
+                      const ageSec = Number.isFinite(genMs) ? Math.max(0, Math.floor((nowMs - genMs) / 1000)) : null;
+                      const expires = typeof l.expires_s === "number" ? l.expires_s : null;
+                      const expired = typeof expires === "number" && expires <= 0;
+                      const nearExpiry = typeof expires === "number" && expires > 0 && expires <= 60;
+                      const staleData = typeof ageSec === "number" && ageSec >= 300;
+
+                      let stroke = "rgba(148,163,184,0.35)";
+                      if (expired) stroke = "rgba(248,113,113,0.75)";
+                      else if (nearExpiry) stroke = "rgba(251,191,36,0.65)";
+                      else if (staleData) stroke = "rgba(148,163,184,0.18)";
+
+                      const dash = expired || staleData ? "6 4" : undefined;
+
+                      return (
+                        <line
+                          key={`${l.s}-${l.t}-${idx}`}
+                          x1={l.x1}
+                          y1={l.y1}
+                          x2={l.x2}
+                          y2={l.y2}
+                          stroke={stroke}
+                          strokeWidth="1.5"
+                          strokeDasharray={dash}
+                        />
+                      );
+                    })}
 
                     {topologyLayout.nodes.map((n) => (
                       <g
@@ -1163,28 +1201,51 @@ const App = () => {
 
                         {hoveredTopologyNodeId === String(n.id) && (
                           <g>
-                            <rect
-                              x={n.x - 120}
-                              y={n.y - 98}
-                              width="240"
-                              height="70"
-                              rx="12"
-                              fill="rgba(2,6,23,0.92)"
-                              stroke="rgba(59,130,246,0.55)"
-                              strokeWidth="1.5"
-                            />
-                            <text x={n.x - 104} y={n.y - 74} fontSize="10" fill="rgba(226,232,240,0.95)" fontWeight="800">
-                              <tspan>别名：</tspan>
-                              <tspan>{String(n.name || "").slice(0, 26) || "-"}</tspan>
-                            </text>
-                            <text x={n.x - 104} y={n.y - 54} fontSize="10" fill="rgba(226,232,240,0.95)" fontWeight="800">
-                              <tspan>地址：</tspan>
-                              <tspan>{String(n.hostPort || n.id || "").slice(0, 30) || "-"}</tspan>
-                            </text>
-                            <text x={n.x - 104} y={n.y - 34} fontSize="10" fill="rgba(148,163,184,0.95)" fontWeight="800">
-                              <tspan>端口：</tspan>
-                              <tspan>{String(n.hostPort || "").split(":")[1] || "-"}</tspan>
-                            </text>
+                            {(() => {
+                              const id = String(n.id);
+                              const connected = (topologyLayout.links || []).filter(l => l.s === id || l.t === id);
+                              const shown = connected.slice(0, 4);
+                              const rows = 3 + shown.length;
+                              const h = 16 + rows * 16;
+                              return (
+                                <>
+                                  <rect
+                                    x={n.x - 120}
+                                    y={n.y - (h + 28)}
+                                    width="240"
+                                    height={h}
+                                    rx="12"
+                                    fill="rgba(2,6,23,0.92)"
+                                    stroke="rgba(59,130,246,0.55)"
+                                    strokeWidth="1.5"
+                                  />
+                                  <text x={n.x - 104} y={n.y - (h + 8)} fontSize="10" fill="rgba(226,232,240,0.95)" fontWeight="800">
+                                    <tspan>别名：</tspan>
+                                    <tspan>{String(n.name || "").slice(0, 26) || "-"}</tspan>
+                                  </text>
+                                  <text x={n.x - 104} y={n.y - (h - 12)} fontSize="10" fill="rgba(226,232,240,0.95)" fontWeight="800">
+                                    <tspan>地址：</tspan>
+                                    <tspan>{String(n.hostPort || n.id || "").slice(0, 30) || "-"}</tspan>
+                                  </text>
+                                  <text x={n.x - 104} y={n.y - (h - 32)} fontSize="10" fill="rgba(148,163,184,0.95)" fontWeight="800">
+                                    <tspan>链路：</tspan>
+                                    <tspan>{connected.length}</tspan>
+                                  </text>
+                                  {shown.map((l, i) => {
+                                    const peer = l.s === id ? l.t : l.s;
+                                    const localPort = l.s === id ? (l.local_port || "-") : (l.remote_port || "-");
+                                    const remotePort = l.s === id ? (l.remote_port || "-") : (l.local_port || "-");
+                                    const exp = typeof l.expires_s === "number" ? ` exp ${l.expires_s}s` : "";
+                                    const line = `${String(peer).slice(0, 18)}  ${localPort} ↔ ${remotePort}${exp}`;
+                                    return (
+                                      <text key={`${peer}-${i}`} x={n.x - 104} y={n.y - (h - 52) + i * 16} fontSize="9" fill="rgba(148,163,184,0.95)" fontWeight="800">
+                                        {line}
+                                      </text>
+                                    );
+                                  })}
+                                </>
+                              );
+                            })()}
                           </g>
                         )}
                       </g>
@@ -1612,6 +1673,23 @@ const App = () => {
                           <input type="number" value={newDevice.inspection_interval} onChange={(e) => setNewDevice({...newDevice, inspection_interval: parseInt(e.target.value)})} className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-4 text-sm outline-none focus:ring-2 focus:ring-blue-500 transition shadow-inner" />
                       </div>
                     </div>
+                    <div className="grid grid-cols-2 gap-6">
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-black text-slate-500 uppercase ml-1 tracking-widest">定期备份</label>
+                        <select value={newDevice.backup_enabled ? "on" : "off"} onChange={(e) => setNewDevice({ ...newDevice, backup_enabled: e.target.value === "on" })} className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-4 text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
+                          <option value="off">关闭</option>
+                          <option value="on">开启</option>
+                        </select>
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-black text-slate-500 uppercase ml-1 tracking-widest">备份间隔 (min)</label>
+                        <input type="number" value={newDevice.backup_interval} onChange={(e) => setNewDevice({ ...newDevice, backup_interval: parseInt(e.target.value) || 0 })} className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-4 text-sm outline-none focus:ring-2 focus:ring-blue-500 transition shadow-inner" />
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-slate-500 uppercase ml-1 tracking-widest">备份文件前缀 (可选)</label>
+                      <input placeholder="例如：core-fw-a" value={newDevice.backup_filename_prefix} onChange={(e) => setNewDevice({ ...newDevice, backup_filename_prefix: e.target.value })} className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-4 text-sm outline-none focus:ring-2 focus:ring-blue-500 transition shadow-inner" />
+                    </div>
                     <div className="grid grid-cols-3 gap-6">
                       <div className="col-span-2 space-y-2">
                         <label className="text-[10px] font-black text-slate-500 uppercase ml-1 tracking-widest">管理 IP 地址</label>
@@ -1685,6 +1763,7 @@ const App = () => {
                       const deviceId = getDeviceId(dev);
                       const status = deviceStatuses[deviceId]?.status;
                       const statusColor = status === 'online' || status === 'threat_detected' ? 'bg-green-500' : status === 'analyzing' ? 'bg-yellow-500' : 'bg-red-500';
+                      const linkedBackupServerId = (dev.backup_server_id || "").trim();
                       return (
                         <div key={deviceId} className="flex items-center justify-between p-6 bg-slate-800/40 border border-slate-700/50 backdrop-blur-xl rounded-3xl group hover:border-blue-500/50 transition-all shadow-2xl relative">
                           <div className={`absolute left-0 top-1/2 -translate-y-1/2 w-1.5 h-10 rounded-r-full ${statusColor} shadow-[0_0_15px_rgba(0,0,0,0.5)]`} />
@@ -1694,6 +1773,44 @@ const App = () => {
                               <button onClick={() => handleUpdateAlias(deviceId)} className="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-blue-300 transition-all"><Edit3 className="w-4 h-4" /></button>
                             </div>
                             <div className="text-[10px] text-slate-500 font-black tracking-widest uppercase">{dev.brand} · {dev.host}:{dev.port} · {status || 'OFFLINE'}</div>
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                              <select
+                                value={linkedBackupServerId}
+                                onChange={(e) => handleUpdateDeviceBackup(dev, { backup_server_id: e.target.value })}
+                                className="bg-slate-900/70 border border-slate-700/50 rounded-xl px-3 py-2 text-[10px] font-black text-slate-300 uppercase tracking-widest outline-none focus:ring-2 focus:ring-blue-500 transition"
+                              >
+                                <option value="">未关联备份服务器</option>
+                                {backupServers.map(s => <option key={s.id} value={s.id}>{s.id} ({s.server_ip})</option>)}
+                              </select>
+                            </div>
+                            {linkedBackupServerId && (
+                              <div className="mt-3 flex flex-wrap items-center gap-2">
+                                <select
+                                  value={dev.backup_enabled ? "on" : "off"}
+                                  onChange={(e) => handleUpdateDeviceBackup(dev, { backup_enabled: e.target.value === "on" })}
+                                  className="bg-slate-900/70 border border-slate-700/50 rounded-xl px-3 py-2 text-[10px] font-black text-slate-300 uppercase tracking-widest outline-none focus:ring-2 focus:ring-blue-500 transition"
+                                >
+                                  <option value="off">备份关闭</option>
+                                  <option value="on">备份开启</option>
+                                </select>
+                                <div className="flex items-center gap-2 bg-slate-900/70 border border-slate-700/50 rounded-xl px-3 py-2">
+                                  <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">间隔</span>
+                                  <input
+                                    type="number"
+                                    value={Number.isFinite(dev.backup_interval) ? dev.backup_interval : 1440}
+                                    onChange={(e) => handleUpdateDeviceBackup(dev, { backup_interval: parseInt(e.target.value) || 0 })}
+                                    className="w-16 bg-transparent text-[10px] text-center font-black text-blue-300 outline-none"
+                                  />
+                                  <span className="text-[10px] font-black uppercase tracking-widest text-slate-600">MIN</span>
+                                </div>
+                                <button
+                                  onClick={() => handleRunBackup(deviceId)}
+                                  className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-[10px] font-black uppercase tracking-widest shadow-xl shadow-blue-900/20 active:scale-95 transition"
+                                >
+                                  立即备份
+                                </button>
+                              </div>
+                            )}
                           </div>
                           <button onClick={() => handleDeleteDevice(deviceId)} className="text-slate-700 hover:text-red-500 p-3 transition-colors bg-slate-900/50 rounded-2xl border border-transparent hover:border-red-500/20"><Trash2 className="w-5 h-5" /></button>
                         </div>
@@ -1926,6 +2043,66 @@ const App = () => {
                       </div>
                     ))}
                     {backupServers.length === 0 && <div className="col-span-2 py-40 text-center text-slate-600 font-black uppercase tracking-[0.3em] bg-slate-800/20 rounded-[40px] text-xs border-2 border-dashed border-slate-800/50 opacity-30">暂无备份服务器</div>}
+                  </div>
+
+                  <div className="mt-10 bg-slate-800/25 border border-slate-700/40 rounded-3xl p-8 shadow-2xl">
+                    <div className="flex justify-between items-end mb-6">
+                      <h2 className="text-xl font-black text-blue-300 uppercase tracking-widest">定期备份任务</h2>
+                      <div className="text-[10px] text-slate-500 font-black uppercase tracking-widest">从资产管理启用</div>
+                    </div>
+                    <div className="space-y-4">
+                      {(devices || []).filter(d => (d?.backup_server_id || "").trim()).map((d) => {
+                        const deviceId = getDeviceId(d);
+                        const st = deviceStatuses?.[deviceId] || {};
+                        const server = (backupServers || []).find(s => s.id === d.backup_server_id);
+                        const last = st?.last_backup ? new Date(st.last_backup).toLocaleString() : "-";
+                        const next = st?.next_backup ? new Date(st.next_backup).toLocaleString() : "-";
+                        return (
+                          <div key={deviceId} className="p-6 bg-slate-900/70 rounded-2xl border border-slate-700/50 hover:border-blue-500/40 transition shadow-xl">
+                            <div className="flex justify-between items-start gap-6">
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-3 mb-3">
+                                  <div className="font-black text-white text-lg truncate">{d.alias || deviceId}</div>
+                                  <div className="text-[10px] font-black px-2 py-0.5 rounded bg-slate-700/30 text-slate-200 border border-slate-700/60 uppercase tracking-widest">{d.brand}</div>
+                                  <div className={`text-[10px] font-black px-2 py-0.5 rounded border uppercase tracking-widest ${d.backup_enabled ? "bg-blue-500/10 text-blue-300 border-blue-500/20" : "bg-slate-500/10 text-slate-400 border-slate-500/20"}`}>
+                                    {d.backup_enabled ? "已开启" : "未开启"}
+                                  </div>
+                                  {server?.protocol && <div className="text-[10px] font-black px-2 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 uppercase tracking-widest">{server.protocol}</div>}
+                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-[10px] font-black uppercase tracking-widest">
+                                  <div className="flex justify-between bg-slate-800/30 rounded-xl px-4 py-3 border border-slate-700/40">
+                                    <span className="text-slate-500">服务器</span>
+                                    <span className="text-slate-200 truncate ml-3">{server ? `${server.id} (${server.server_ip})` : d.backup_server_id}</span>
+                                  </div>
+                                  <div className="flex justify-between bg-slate-800/30 rounded-xl px-4 py-3 border border-slate-700/40">
+                                    <span className="text-slate-500">间隔</span>
+                                    <span className="text-slate-200">{Number.isFinite(d.backup_interval) ? `${d.backup_interval} min` : "-"}</span>
+                                  </div>
+                                  <div className="flex justify-between bg-slate-800/30 rounded-xl px-4 py-3 border border-slate-700/40">
+                                    <span className="text-slate-500">上次</span>
+                                    <span className="text-slate-200">{last}</span>
+                                  </div>
+                                  <div className="flex justify-between bg-slate-800/30 rounded-xl px-4 py-3 border border-slate-700/40">
+                                    <span className="text-slate-500">下次</span>
+                                    <span className="text-slate-200">{next}</span>
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="flex flex-col gap-3">
+                                <button onClick={() => handleRunBackup(deviceId)} className="px-6 py-3 rounded-2xl bg-blue-600 hover:bg-blue-700 text-white text-[10px] font-black uppercase tracking-widest shadow-xl shadow-blue-900/20 active:scale-95 transition">
+                                  立即备份
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                      {(devices || []).filter(d => (d?.backup_server_id || "").trim()).length === 0 && (
+                        <div className="py-24 text-center text-slate-600 font-black uppercase tracking-[0.3em] bg-slate-800/20 rounded-[40px] text-xs border-2 border-dashed border-slate-800/50 opacity-30">
+                          暂无已关联备份服务器的设备
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
