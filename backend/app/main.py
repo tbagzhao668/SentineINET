@@ -5,8 +5,10 @@ from typing import List, Optional, Dict, Any
 import asyncio
 import datetime
 import json
+import hashlib
 import logging
 import re
+import secrets
 import socket
 import time
 import uuid
@@ -94,6 +96,19 @@ class InspectionSettings(BaseModel):
     auto_inspect: bool
     enabled_devices: List[str]
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginResponse(BaseModel):
+    token: str
+    username: str
+    force_change: bool = False
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
 class DeployRequest(BaseModel):
     ips: List[str]
 
@@ -127,6 +142,8 @@ db = {
     "backup_servers": {}, # 存储备份服务器: {id: BackupServer}
     "backup_history": {}, # {device_id: [history_entry, ...]}
     "last_backup": {},    # {device_id: datetime}
+    "auth": {"users": {}},
+    "auth_sessions": {},
     "agent_sessions": {},
     "settings": {
         "auto_inspect": False,
@@ -167,6 +184,7 @@ def _serialize_persisted_state():
         "backup_servers": _to_jsonable(db.get("backup_servers", {})),
         "backup_history": _to_jsonable(db.get("backup_history", {})),
         "last_backup": _to_jsonable(db.get("last_backup", {})),
+        "auth": _to_jsonable(db.get("auth", {"users": {}})),
         "agent_sessions": _to_jsonable(db.get("agent_sessions", {})),
         "settings": _to_jsonable(db.get("settings", {"auto_inspect": False, "enabled_devices": []})),
     }
@@ -237,6 +255,157 @@ def _load_persisted_state():
     sessions_raw = raw.get("agent_sessions", {}) or {}
     if isinstance(sessions_raw, dict):
         db["agent_sessions"] = sessions_raw
+
+    auth_raw = raw.get("auth", {}) or {}
+    if isinstance(auth_raw, dict):
+        users_raw = auth_raw.get("users", {}) or {}
+        if isinstance(users_raw, dict):
+            db["auth"] = {"users": users_raw}
+
+# --- 认证（登录/改密）---
+
+def _pbkdf2_hash_password(password: str, salt_hex: Optional[str] = None, iterations: int = 150_000):
+    salt = bytes.fromhex(salt_hex) if (salt_hex or "").strip() else secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
+    return {"salt": salt.hex(), "hash": dk.hex(), "iterations": int(iterations)}
+
+def _verify_password(password: str, user: Dict[str, Any]) -> bool:
+    try:
+        salt = str(user.get("salt") or "").strip()
+        stored = str(user.get("password_hash") or "").strip()
+        it = int(user.get("iterations") or 0)
+        if not salt or not stored or it <= 0:
+            return False
+        computed = _pbkdf2_hash_password(password, salt_hex=salt, iterations=it)
+        return secrets.compare_digest(computed["hash"], stored)
+    except Exception:
+        return False
+
+def _ensure_auth_bootstrap():
+    auth = db.get("auth")
+    if not isinstance(auth, dict):
+        db["auth"] = {"users": {}}
+        auth = db["auth"]
+    users = auth.get("users")
+    if not isinstance(users, dict):
+        auth["users"] = {}
+        users = auth["users"]
+
+    if users:
+        return
+
+    record = _pbkdf2_hash_password("admin")
+    users["admin"] = {
+        "username": "admin",
+        "password_hash": record["hash"],
+        "salt": record["salt"],
+        "iterations": record["iterations"],
+        "force_change": True,
+        "created_at": datetime.datetime.now().isoformat(),
+        "updated_at": None,
+    }
+    _save_persisted_state()
+
+def _issue_token(username: str, ttl_hours: int = 24 * 7) -> str:
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.datetime.now() + datetime.timedelta(hours=int(ttl_hours))
+    sessions = db.get("auth_sessions")
+    if not isinstance(sessions, dict):
+        db["auth_sessions"] = {}
+        sessions = db["auth_sessions"]
+    sessions[token] = {"username": username, "expires_at": expires_at}
+    return token
+
+def _get_current_user_from_request(request: Request) -> Dict[str, Any]:
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    if not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="未登录")
+    token = auth_header.split(" ", 1)[1].strip()
+    sessions = db.get("auth_sessions")
+    if not isinstance(sessions, dict):
+        raise HTTPException(status_code=401, detail="未登录")
+    sess = sessions.get(token)
+    if not isinstance(sess, dict):
+        raise HTTPException(status_code=401, detail="未登录")
+
+    expires_at = sess.get("expires_at")
+    if isinstance(expires_at, str):
+        try:
+            expires_at = datetime.datetime.fromisoformat(expires_at)
+        except Exception:
+            expires_at = None
+    if isinstance(expires_at, datetime.datetime) and expires_at < datetime.datetime.now():
+        sessions.pop(token, None)
+        raise HTTPException(status_code=401, detail="登录已过期")
+
+    username = str(sess.get("username") or "").strip()
+    user = (db.get("auth") or {}).get("users", {}).get(username)
+    if not isinstance(user, dict):
+        raise HTTPException(status_code=401, detail="用户不存在")
+    return user
+
+@app.middleware("http")
+async def auth_guard(request: Request, call_next):
+    if request.method.upper() == "OPTIONS":
+        return await call_next(request)
+    public_paths = {
+        "/",
+        "/healthz",
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+        "/auth/login",
+    }
+    if request.url.path in public_paths or request.url.path.startswith("/docs"):
+        return await call_next(request)
+    _get_current_user_from_request(request)
+    return await call_next(request)
+
+@app.post("/auth/login", response_model=LoginResponse)
+async def login(req: LoginRequest):
+    _ensure_auth_bootstrap()
+    username = (req.username or "").strip()
+    password = req.password or ""
+    user = (db.get("auth") or {}).get("users", {}).get(username)
+    if not isinstance(user, dict) or (not _verify_password(password, user)):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    token = _issue_token(username)
+    return {
+        "token": token,
+        "username": username,
+        "force_change": bool(user.get("force_change", False)),
+    }
+
+@app.get("/auth/me")
+async def me(request: Request):
+    user = _get_current_user_from_request(request)
+    return {"username": user.get("username"), "force_change": bool(user.get("force_change", False))}
+
+@app.post("/auth/change_password")
+async def change_password(request: Request, body: ChangePasswordRequest):
+    user = _get_current_user_from_request(request)
+    username = str(user.get("username") or "").strip()
+
+    if not _verify_password(body.old_password or "", user):
+        raise HTTPException(status_code=400, detail="旧密码不正确")
+    new_password = (body.new_password or "").strip()
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="新密码长度至少 6 位")
+
+    record = _pbkdf2_hash_password(new_password)
+    users = (db.get("auth") or {}).get("users", {})
+    if not isinstance(users, dict) or username not in users:
+        raise HTTPException(status_code=400, detail="用户不存在")
+    users[username] = {
+        **users[username],
+        "password_hash": record["hash"],
+        "salt": record["salt"],
+        "iterations": record["iterations"],
+        "force_change": False,
+        "updated_at": datetime.datetime.now().isoformat(),
+    }
+    await asyncio.to_thread(_save_persisted_state)
+    return {"message": "密码已更新"}
 
 # --- 辅助函数：Skill 智能缓存逻辑 ---
 
@@ -1671,6 +1840,7 @@ async def backup_scheduler():
 @app.on_event("startup")
 async def startup_event():
     _load_persisted_state()
+    _ensure_auth_bootstrap()
     asyncio.create_task(inspection_scheduler())
     asyncio.create_task(connectivity_monitor())
     asyncio.create_task(backup_scheduler())

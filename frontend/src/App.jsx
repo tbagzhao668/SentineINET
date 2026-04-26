@@ -8,6 +8,21 @@ const App = () => {
   const APP_NAME = "SentinelNet";
   const APP_TAGLINE = "网络运维与安全平台";
   const [activeTab, setActiveTab] = useState('dashboard');
+
+  const [authToken, setAuthToken] = useState(() => {
+    try {
+      return localStorage.getItem("auth.token") || "";
+    } catch {
+      return "";
+    }
+  });
+  const [authUser, setAuthUser] = useState({ username: "", force_change: false });
+  const [authChecked, setAuthChecked] = useState(false);
+  const [loginForm, setLoginForm] = useState({ username: "admin", password: "" });
+  const [loginError, setLoginError] = useState("");
+  const [pwdForm, setPwdForm] = useState({ old_password: "", new_password: "", confirm: "" });
+  const [pwdSaving, setPwdSaving] = useState(false);
+  const [pwdMsg, setPwdMsg] = useState("");
   
   // 数据状态
   const [devices, setDevices] = useState([]);
@@ -149,13 +164,116 @@ const App = () => {
   );
 
   useEffect(() => {
+    if (authToken) {
+      axios.defaults.headers.common["Authorization"] = `Bearer ${authToken}`;
+    } else {
+      delete axios.defaults.headers.common["Authorization"];
+    }
+  }, [authToken]);
+
+  useEffect(() => {
+    const id = axios.interceptors.response.use(
+      (res) => res,
+      (err) => {
+        if (err?.response?.status === 401) {
+          try { localStorage.removeItem("auth.token"); } catch {}
+          setAuthToken("");
+          setAuthUser({ username: "", force_change: false });
+          setAuthChecked(true);
+        }
+        return Promise.reject(err);
+      }
+    );
+    return () => axios.interceptors.response.eject(id);
+  }, []);
+
+  useEffect(() => {
+    const run = async () => {
+      if (!authToken) {
+        setAuthChecked(true);
+        return;
+      }
+      try {
+        const res = await axios.get(`${API_BASE}/auth/me`);
+        setAuthUser(res.data || { username: "", force_change: false });
+      } catch {
+        try { localStorage.removeItem("auth.token"); } catch {}
+        setAuthToken("");
+        setAuthUser({ username: "", force_change: false });
+      } finally {
+        setAuthChecked(true);
+      }
+    };
+    run();
+  }, [authToken]);
+
+  useEffect(() => {
+    if (!authChecked || !authToken) return;
     fetchInitialData();
     const timer = setInterval(() => {
       fetchPendingActions();
       fetchDeviceStatuses();
     }, 5000);
     return () => clearInterval(timer);
-  }, []);
+  }, [authChecked, authToken]);
+
+  const handleLogin = async () => {
+    setLoginError("");
+    setPwdMsg("");
+    try {
+      const res = await axios.post(`${API_BASE}/auth/login`, loginForm);
+      const token = res.data?.token || "";
+      if (!token) {
+        setLoginError("登录失败：未返回 token");
+        return;
+      }
+      try { localStorage.setItem("auth.token", token); } catch {}
+      setAuthToken(token);
+      setAuthUser({ username: res.data?.username || loginForm.username, force_change: !!res.data?.force_change });
+      if (res.data?.force_change) setActiveTab("ai");
+    } catch (e) {
+      const detail = e?.response?.data?.detail || e?.message || "未知错误";
+      setLoginError(String(detail));
+    }
+  };
+
+  const handleLogout = () => {
+    try { localStorage.removeItem("auth.token"); } catch {}
+    setAuthToken("");
+    setAuthUser({ username: "", force_change: false });
+    setAuthChecked(true);
+    setActiveTab("dashboard");
+  };
+
+  const handleChangePassword = async () => {
+    setPwdMsg("");
+    const oldPassword = pwdForm.old_password || "";
+    const newPassword = pwdForm.new_password || "";
+    if (!oldPassword || !newPassword) {
+      setPwdMsg("请输入旧密码和新密码");
+      return;
+    }
+    if (newPassword.length < 6) {
+      setPwdMsg("新密码长度至少 6 位");
+      return;
+    }
+    if (newPassword !== (pwdForm.confirm || "")) {
+      setPwdMsg("两次输入的新密码不一致");
+      return;
+    }
+    setPwdSaving(true);
+    try {
+      await axios.post(`${API_BASE}/auth/change_password`, { old_password: oldPassword, new_password: newPassword });
+      setPwdForm({ old_password: "", new_password: "", confirm: "" });
+      setPwdMsg("密码已更新");
+      setAuthUser(u => ({ ...u, force_change: false }));
+    } catch (e) {
+      const detail = e?.response?.data?.detail || e?.message || "未知错误";
+      setPwdMsg("更新失败: " + detail);
+    } finally {
+      setPwdSaving(false);
+    }
+  };
 
   const fetchDeviceStatuses = async () => {
     try {
@@ -876,6 +994,47 @@ const App = () => {
     }
   };
 
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen bg-slate-900 text-slate-100 font-sans flex items-center justify-center">
+        <div className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-500">Loading...</div>
+      </div>
+    );
+  }
+
+  if (!authToken) {
+    return (
+      <div className="min-h-screen bg-slate-900 text-slate-100 font-sans flex items-center justify-center p-8">
+        <div className="w-full max-w-md bg-slate-800/40 border border-slate-700/50 rounded-[40px] p-10 shadow-2xl">
+          <div className="flex items-center gap-3 mb-8">
+            <Shield className="w-8 h-8 text-blue-500" />
+            <div className="flex flex-col leading-tight">
+              <div className="font-black text-xl">{APP_NAME}</div>
+              <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">{APP_TAGLINE}</div>
+            </div>
+          </div>
+          <div className="space-y-6">
+            <div className="space-y-2">
+              <label className="text-[10px] font-black text-slate-500 uppercase ml-1 tracking-widest">用户名</label>
+              <input value={loginForm.username} onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value })} className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-4 text-sm outline-none focus:ring-2 focus:ring-blue-500 transition shadow-inner" />
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] font-black text-slate-500 uppercase ml-1 tracking-widest">密码</label>
+              <input type="password" value={loginForm.password} onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} onKeyDown={(e) => { if (e.key === "Enter") handleLogin(); }} className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-4 text-sm outline-none focus:ring-2 focus:ring-blue-500 transition shadow-inner" />
+            </div>
+            {loginError && <div className="text-red-400 text-xs font-bold">{loginError}</div>}
+            <button onClick={handleLogin} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-black uppercase tracking-[0.3em] text-xs py-5 rounded-2xl shadow-2xl shadow-blue-900/40 transition-all active:scale-95">
+              登录
+            </button>
+            <div className="text-[10px] text-slate-500 font-black uppercase tracking-widest">
+              默认账号：admin / admin（首次登录后请在“AI 配置”页修改密码）
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 font-sans flex overflow-hidden">
       {/* 侧边导航栏 */}
@@ -939,6 +1098,15 @@ const App = () => {
             <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
               {settings.auto_inspect ? '巡检引擎运行中' : '巡检引擎已停止'}
             </div>
+          </div>
+          <div className="mt-4 flex items-center justify-between gap-3 px-4 py-3 rounded-xl bg-slate-900/50 border border-slate-700/50">
+            <div className="min-w-0">
+              <div className="text-[10px] font-black uppercase tracking-widest text-slate-500">当前账号</div>
+              <div className="text-xs font-black text-slate-200 truncate">{authUser.username || "-"}</div>
+            </div>
+            <button onClick={handleLogout} className="px-4 py-2 rounded-xl bg-slate-800/60 hover:bg-slate-700/60 text-slate-200 text-[10px] font-black uppercase tracking-widest border border-slate-700/50 active:scale-95 transition">
+              退出
+            </button>
           </div>
         </div>
       </aside>
@@ -2233,6 +2401,11 @@ const App = () => {
               </header>
 
               <div className="max-w-2xl mx-auto">
+                {authUser.force_change && (
+                  <div className="mb-8 bg-red-500/10 border border-red-500/20 text-red-300 rounded-3xl p-6 text-xs font-bold">
+                    检测到默认密码未修改，请先修改密码后再投入使用。
+                  </div>
+                )}
                 <div className="bg-slate-800/40 p-12 rounded-[40px] border border-slate-700/50 backdrop-blur-xl shadow-2xl">
                   <div className="text-center mb-12">
                     <div className="bg-blue-600/10 w-20 h-20 rounded-[30px] flex items-center justify-center mx-auto mb-6 border border-blue-500/20 shadow-inner">
@@ -2272,6 +2445,40 @@ const App = () => {
                       className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-700 text-white font-black uppercase tracking-[0.3em] text-xs py-6 rounded-2xl shadow-2xl shadow-blue-900/40 transition-all mt-8 active:scale-95"
                     >
                       {aiSaving ? "保存中..." : "保存引擎配置"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-10 bg-slate-800/40 p-12 rounded-[40px] border border-slate-700/50 backdrop-blur-xl shadow-2xl">
+                  <div className="text-center mb-12">
+                    <div className="bg-green-600/10 w-20 h-20 rounded-[30px] flex items-center justify-center mx-auto mb-6 border border-green-500/20 shadow-inner">
+                      <Settings className="w-10 h-10 text-green-500" />
+                    </div>
+                    <h2 className="text-2xl font-black text-white uppercase tracking-tight">账号与安全</h2>
+                    <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 mt-2">当前账号：{authUser.username || "-"}</div>
+                  </div>
+
+                  <div className="space-y-6">
+                    <div className="space-y-3">
+                      <label className="text-[10px] font-black text-slate-500 uppercase ml-1 tracking-[0.2em]">旧密码</label>
+                      <input type="password" value={pwdForm.old_password} onChange={(e) => setPwdForm({ ...pwdForm, old_password: e.target.value })} className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-5 outline-none focus:ring-2 focus:ring-blue-500 transition shadow-inner text-sm" />
+                    </div>
+                    <div className="space-y-3">
+                      <label className="text-[10px] font-black text-slate-500 uppercase ml-1 tracking-[0.2em]">新密码</label>
+                      <input type="password" value={pwdForm.new_password} onChange={(e) => setPwdForm({ ...pwdForm, new_password: e.target.value })} className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-5 outline-none focus:ring-2 focus:ring-blue-500 transition shadow-inner text-sm" />
+                    </div>
+                    <div className="space-y-3">
+                      <label className="text-[10px] font-black text-slate-500 uppercase ml-1 tracking-[0.2em]">确认新密码</label>
+                      <input type="password" value={pwdForm.confirm} onChange={(e) => setPwdForm({ ...pwdForm, confirm: e.target.value })} onKeyDown={(e) => { if (e.key === "Enter") handleChangePassword(); }} className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-5 outline-none focus:ring-2 focus:ring-blue-500 transition shadow-inner text-sm" />
+                    </div>
+                    {pwdMsg && <div className={`${pwdMsg.startsWith("密码已更新") ? "text-green-400" : "text-red-400"} text-xs font-bold`}>{pwdMsg}</div>}
+                    <button
+                      type="button"
+                      onClick={handleChangePassword}
+                      disabled={pwdSaving}
+                      className="w-full bg-green-600 hover:bg-green-700 disabled:bg-slate-700 text-white font-black uppercase tracking-[0.3em] text-xs py-6 rounded-2xl shadow-2xl shadow-green-900/30 transition-all mt-4 active:scale-95"
+                    >
+                      {pwdSaving ? "更新中..." : "更新密码"}
                     </button>
                   </div>
                 </div>
