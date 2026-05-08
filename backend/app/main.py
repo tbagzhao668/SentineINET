@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -6,12 +7,14 @@ import asyncio
 import datetime
 import json
 import hashlib
+import ipaddress
 import logging
 import re
 import secrets
 import socket
 import time
 import uuid
+import httpx
 from threading import Lock
 from pathlib import Path
 from urllib.parse import urlparse
@@ -22,13 +25,86 @@ app = FastAPI(title="SentinelAI API")
 
 topology_logger = logging.getLogger("uvicorn.error")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _llm_should_use_raw_http(base_url: Optional[str], model: Optional[str]) -> bool:
+    bu = (base_url or "").strip().lower()
+    m = (model or "").strip().lower()
+    if "api.deepseek.com" in bu:
+        return True
+    if m.startswith("deepseek-"):
+        return True
+    return False
+
+def _llm_raw_chat_completions_create(api_key: str, base_url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
+    url = (base_url or "").rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    with httpx.Client(timeout=timeout_s) as client:
+        r = client.post(url, headers=headers, json=payload)
+        if r.status_code >= 400:
+            try:
+                raise RuntimeError(f"Error code: {r.status_code} - {r.json()}")
+            except Exception:
+                raise RuntimeError(f"Error code: {r.status_code} - {r.text[:800]}")
+        return r.json()
+
+def _llm_chat_create(analyzer: AIAnalyzer, ai_conf: Any, *, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, tool_choice: Optional[str] = None, response_format: Optional[Dict[str, Any]] = None, timeout_s: float = 35) -> Any:
+    base_url = getattr(ai_conf, "base_url", None)
+    model = getattr(ai_conf, "model", None)
+    api_key = getattr(ai_conf, "api_key", "") or ""
+    if _llm_should_use_raw_http(base_url, model):
+        payload: Dict[str, Any] = {"model": model, "messages": messages, "stream": False}
+        if tools is not None:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if response_format is not None:
+            payload["response_format"] = response_format
+        return _llm_raw_chat_completions_create(api_key=api_key, base_url=base_url or "https://api.deepseek.com/v1", payload=payload, timeout_s=float(timeout_s))
+    kwargs: Dict[str, Any] = {"model": model, "messages": messages, "timeout": timeout_s}
+    if tools is not None:
+        kwargs["tools"] = tools
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+    return analyzer.client.chat.completions.create(**kwargs)
+
+def _llm_extract_message(resp: Any) -> Dict[str, Any]:
+    if isinstance(resp, dict):
+        msg = (((resp.get("choices") or [{}])[0]).get("message") or {}) if isinstance(resp.get("choices"), list) else {}
+        tool_calls = msg.get("tool_calls") if isinstance(msg.get("tool_calls"), list) else []
+        return {
+            "content": msg.get("content") or "",
+            "tool_calls": tool_calls,
+            "reasoning_content": msg.get("reasoning_content") or msg.get("reasoning") or "",
+        }
+
+    try:
+        msg_obj = resp.choices[0].message
+    except Exception:
+        return {"content": "", "tool_calls": [], "reasoning_content": ""}
+
+    tool_calls_out: List[Dict[str, Any]] = []
+    for tc in (getattr(msg_obj, "tool_calls", None) or []):
+        try:
+            tool_calls_out.append(
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+            )
+        except Exception:
+            pass
+    reasoning = ""
+    for attr in ("reasoning_content", "reasoning"):
+        try:
+            v = getattr(msg_obj, attr, None)
+            if isinstance(v, str) and v.strip():
+                reasoning = v
+                break
+        except Exception:
+            pass
+    return {"content": getattr(msg_obj, "content", "") or "", "tool_calls": tool_calls_out, "reasoning_content": reasoning}
 
 @app.get("/")
 async def root():
@@ -348,6 +424,14 @@ def _get_current_user_from_request(request: Request) -> Dict[str, Any]:
 async def auth_guard(request: Request, call_next):
     if request.method.upper() == "OPTIONS":
         return await call_next(request)
+    origin = request.headers.get("origin") or request.headers.get("Origin")
+    cors_headers = {}
+    if origin:
+        cors_headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        }
     public_paths = {
         "/",
         "/healthz",
@@ -358,8 +442,21 @@ async def auth_guard(request: Request, call_next):
     }
     if request.url.path in public_paths or request.url.path.startswith("/docs"):
         return await call_next(request)
-    _get_current_user_from_request(request)
+    try:
+        _get_current_user_from_request(request)
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"detail": e.detail}, headers=cors_headers)
+    except Exception:
+        return JSONResponse(status_code=401, content={"detail": "未登录"}, headers=cors_headers)
     return await call_next(request)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(req: LoginRequest):
@@ -2618,6 +2715,15 @@ def _agent_extract_vlan_ids(text: str) -> List[int]:
         out.append(v)
     return out
 
+def _mask_to_prefixlen(mask: str) -> Optional[int]:
+    m = (mask or "").strip()
+    if not m:
+        return None
+    try:
+        return int(ipaddress.IPv4Network(f"0.0.0.0/{m}").prefixlen)
+    except Exception:
+        return None
+
 def _agent_validate_step_commands(step_text: str, commands: List[str]) -> Optional[str]:
     st = (step_text or "")
     cmd_text = "\n".join([str(x) for x in (commands or [])]).strip()
@@ -2640,8 +2746,16 @@ def _agent_validate_step_commands(step_text: str, commands: List[str]) -> Option
         if ip and ip.lower() not in cmd_low:
             return f"步骤要求的 IP 未出现在命令中：{ip}"
         if ip and mask:
-            if f"ip address {ip} {mask}".lower() not in cmd_low:
-                return f"步骤要求的 IP/掩码未按期望下发：ip address {ip} {mask}"
+            expected_mask = f"ip address {ip} {mask}".lower()
+            if expected_mask in cmd_low:
+                continue
+            plen = _mask_to_prefixlen(mask)
+            if plen is not None:
+                expected_plen1 = f"ip address {ip} {plen}".lower()
+                expected_plen2 = f"ip address {ip}/{plen}".lower()
+                if expected_plen1 in cmd_low or expected_plen2 in cmd_low:
+                    continue
+            return f"步骤要求的 IP/掩码未按期望下发：ip address {ip} {mask}"
 
     iface = _agent_extract_iface_requirement(st)
     if iface and iface.lower() not in cmd_low:
@@ -2652,6 +2766,112 @@ def _agent_validate_step_commands(step_text: str, commands: List[str]) -> Option
         if f"vlan {v}".lower() not in cmd_low and f"vlanif {v}".lower() not in cmd_low:
             return f"步骤要求的 VLAN/VLANIF 未出现在命令中：{v}"
 
+    return None
+
+def _agent_h3c_build_gre_tunnel_commands(step_text: str) -> Optional[List[str]]:
+    st = (step_text or "").strip()
+    if not st:
+        return None
+    st_low = st.lower()
+    if ("tunnel" not in st_low) or ("gre" not in st_low):
+        return None
+
+    src = None
+    dst = None
+    m = re.search(r"(?i)\bsource\b[^0-9]*(\d{1,3}(?:\.\d{1,3}){3})", st)
+    if m:
+        src = m.group(1)
+    m = re.search(r"(?i)\b(destination|dest)\b[^0-9]*(\d{1,3}(?:\.\d{1,3}){3})", st)
+    if m:
+        dst = m.group(2)
+    m = re.search(r"源(?:地址)?[^0-9]*(\d{1,3}(?:\.\d{1,3}){3})", st)
+    if m:
+        src = src or m.group(1)
+    m = re.search(r"(?:目的(?:地址)?|对端(?:地址)?)\\s*[^0-9]*(\d{1,3}(?:\.\d{1,3}){3})", st)
+    if m:
+        dst = dst or m.group(1)
+
+    req_ips = _agent_extract_ip_requirements(st)
+    tun_ip = None
+    tun_mask = None
+    for x in req_ips:
+        ip = x.get("ip")
+        mask = x.get("mask")
+        if not ip or not mask:
+            continue
+        if src and ip == src:
+            continue
+        if dst and ip == dst:
+            continue
+        tun_ip = ip
+        tun_mask = mask
+        break
+
+    if not src or not dst or not tun_ip or not tun_mask:
+        return None
+
+    tunnel_no = 0
+    m = re.search(r"(?i)\btunnel\b\\s*(\\d+)", st)
+    if m:
+        try:
+            tunnel_no = int(m.group(1))
+        except Exception:
+            tunnel_no = 0
+
+    return [
+        f"interface Tunnel {tunnel_no}",
+        "tunnel-protocol gre",
+        f"source {src}",
+        f"destination {dst}",
+        f"ip address {tun_ip} {tun_mask}",
+    ]
+
+def _strip_dsml(text: str) -> str:
+    t = text or ""
+    if "<｜DSML｜" not in t:
+        return t
+    t = re.sub(r"<｜DSML｜[\s\S]*?>", "", t)
+    t = re.sub(r"</｜DSML｜[\s\S]*?>", "", t)
+    return t.strip()
+
+def _detect_cli_error(brand: str, output: str) -> Optional[str]:
+    t = (output or "").strip()
+    if not t:
+        return None
+    tl = t.lower()
+
+    patterns = [
+        r"%\s*unrecognized\s+command",
+        r"%\s*unknown\s+command",
+        r"%\s*incomplete\s+command",
+        r"%\s*ambiguous\s+command",
+        r"invalid\s+input",
+        r"unknown\s+command",
+        r"incomplete\s+command",
+        r"ambiguous\s+command",
+        r"error\s*:",
+        r"wrong\s+parameter",
+        r"unrecognized\s+keyword",
+        r"illegal\s+parameter",
+    ]
+
+    b = (brand or "").strip().lower()
+    if b == "h3c":
+        patterns.extend(
+            [
+                r"^%\s*.+$",
+                r"^error:\s*.+$",
+                r"wrong\s+parameter",
+                r"invalid\s+parameter",
+                r"not\s+support",
+            ]
+        )
+
+    for p in patterns:
+        if re.search(p, tl, flags=re.IGNORECASE | re.MULTILINE):
+            m = re.search(p, t, flags=re.IGNORECASE | re.MULTILINE)
+            hit = (m.group(0) if m else p).strip()
+            return hit[:160]
     return None
 
 def _agent_get_session_or_404(session_id: str) -> Dict[str, Any]:
@@ -2693,7 +2913,11 @@ async def agent_run_step(req: AgentRunStepRequest):
         raise HTTPException(status_code=400, detail="step_index 越界")
     step = steps[idx]
 
+    prev_attempt: Optional[Dict[str, Any]] = None
+    if req.action != "retry" and step.get("status") == "failed":
+        prev_attempt = {"summary": step.get("summary") or "", "tool_log": step.get("tool_log") or []}
     if req.action == "retry":
+        prev_attempt = {"summary": step.get("summary") or "", "tool_log": step.get("tool_log") or []}
         step["status"] = "pending"
         step["summary"] = ""
         step["tool_log"] = []
@@ -2717,6 +2941,47 @@ async def agent_run_step(req: AgentRunStepRequest):
     device_ids = session.get("device_ids") or []
     allowed_devices = _sanitize_devices_for_agent(device_ids)
     allowed_ids = [d["id"] for d in allowed_devices]
+
+    if bool(session.get("allow_config")) and len(allowed_ids) == 1:
+        device_id = allowed_ids[0]
+        dev = db["devices"].get(device_id)
+        if dev is not None and (getattr(dev, "brand", "") or "").strip().lower() == "h3c":
+            fast_cmds = _agent_h3c_build_gre_tunnel_commands(step_text)
+            if fast_cmds:
+                t0 = time.perf_counter()
+                try:
+                    adapter = FirewallAdapter(dev.brand, dev.host, dev.username, dev.password, dev.port, dev.secret, dev.protocol)
+                    await asyncio.to_thread(adapter.execute_commands, fast_cmds, True)
+                    step_dt_ms = int((time.perf_counter() - step_t0) * 1000)
+                    tool_calls_log = [
+                        {"tool": "run_device_commands", "ok": True, "dt_ms": int((time.perf_counter() - t0) * 1000), "error": None}
+                    ]
+                    step["status"] = "done"
+                    step["ended_at"] = _agent_now_iso()
+                    step["summary"] = "已按步骤要求创建 GRE Tunnel 接口并下发源/目的/隧道IP配置。"
+                    step["tool_log"] = tool_calls_log
+                    run["updated_at"] = _agent_now_iso()
+                    _agent_add_event(session, "step_done", {"run_id": run.get("id"), "step_index": idx, "dt_ms": step_dt_ms})
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(asyncio.to_thread(_save_persisted_state))
+                    except RuntimeError:
+                        _save_persisted_state()
+                    return {"session_id": session.get("id"), "run": run, "events": session.get("events") or []}
+                except Exception as e:
+                    step_dt_ms = int((time.perf_counter() - step_t0) * 1000)
+                    step["status"] = "failed"
+                    step["ended_at"] = _agent_now_iso()
+                    step["summary"] = f"步骤执行失败：{str(e)[:240]}"
+                    step["tool_log"] = [{"tool": "run_device_commands", "ok": False, "dt_ms": int((time.perf_counter() - t0) * 1000), "error": str(e)[:240]}]
+                    run["updated_at"] = _agent_now_iso()
+                    _agent_add_event(session, "step_failed", {"run_id": run.get("id"), "step_index": idx, "dt_ms": step_dt_ms, "error": str(e)[:240]})
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(asyncio.to_thread(_save_persisted_state))
+                    except RuntimeError:
+                        _save_persisted_state()
+                    return {"session_id": session.get("id"), "run": run, "events": session.get("events") or []}
 
     tools = [
         {
@@ -2744,6 +3009,9 @@ async def agent_run_step(req: AgentRunStepRequest):
     async def _tool_run_device_commands(device_id: str, commands: List[str]):
         if str(device_id) not in set(allowed_ids):
             raise ValueError("DENY_DEVICE: device_id 不在允许列表中")
+        commands = [str(x).strip() for x in (commands or []) if str(x).strip()]
+        if not commands:
+            raise ValueError("PARAM_INVALID: commands 不能为空")
         if not bool(session.get("allow_config")):
             for c in commands:
                 if not _looks_readonly_command(c):
@@ -2760,8 +3028,33 @@ async def agent_run_step(req: AgentRunStepRequest):
         if dev is None:
             raise ValueError("NOT_FOUND: 设备不存在")
         adapter = FirewallAdapter(dev.brand, dev.host, dev.username, dev.password, dev.port, dev.secret, dev.protocol)
-        out = await asyncio.to_thread(adapter.execute_commands, commands)
-        return {"device_id": device_id, "commands": commands, "output": _truncate_text(out or "", 6000)}
+
+        def _strip_mode_cmds(brand: str, cmds: List[str]) -> List[str]:
+            b = (brand or "").strip().lower()
+            if b == "h3c":
+                drop = {"system-view", "return"}
+                return [c for c in cmds if c.strip().lower() not in drop]
+            return cmds
+
+        readonly_cmds = [c for c in commands if _looks_readonly_command(c)]
+        config_cmds = [c for c in commands if not _looks_readonly_command(c)]
+
+        output_parts: List[str] = []
+        if bool(session.get("allow_config")) and config_cmds:
+            config_cmds = _strip_mode_cmds(getattr(dev, "brand", "") or "", config_cmds)
+            if config_cmds:
+                out_cfg = await asyncio.to_thread(adapter.execute_commands, config_cmds, True)
+                if out_cfg:
+                    output_parts.append(str(out_cfg))
+        if readonly_cmds:
+            out_ro = await asyncio.to_thread(adapter.execute_commands, readonly_cmds, False)
+            if out_ro:
+                output_parts.append(str(out_ro))
+        output_text = _truncate_text("\n".join(output_parts).strip(), 6000)
+        cli_err = _detect_cli_error(getattr(dev, "brand", "") or "", output_text)
+        if cli_err:
+            return {"ok": False, "error": f"DEVICE_CLI_ERROR: {cli_err}", "device_id": device_id, "commands": commands, "output": output_text}
+        return {"ok": True, "device_id": device_id, "commands": commands, "output": output_text}
 
     system_prompt = (
         "你是网络领域的执行代理。现在只执行一个步骤，不要输出多余内容。\n"
@@ -2773,29 +3066,30 @@ async def agent_run_step(req: AgentRunStepRequest):
         {"role": "system", "content": json.dumps({"allowed_device_ids": allowed_ids, "allow_config": bool(session.get("allow_config"))}, ensure_ascii=False)},
         {"role": "user", "content": f"步骤：{step_text}"},
     ]
+    if prev_attempt and ((prev_attempt.get("summary") or "").strip() or (prev_attempt.get("tool_log") or [])):
+        messages_for_model.append(
+            {"role": "system", "content": f"上一次尝试失败信息（用于你修正命令并重试）：{json.dumps(prev_attempt, ensure_ascii=False)[:2600]}"}
+        )
 
     tool_calls_log = []
     last_tool_ok: Optional[bool] = None
     last_tool_error: Optional[str] = None
+
     try:
-        for _ in range(3):
-            resp = analyzer.client.chat.completions.create(
-                model=ai_conf.model,
-                messages=messages_for_model,
-                tools=tools,
-                tool_choice="auto",
-                timeout=35,
-            )
-            msg = resp.choices[0].message
-            if getattr(msg, "tool_calls", None):
-                assistant_payload: Dict[str, Any] = {"role": "assistant", "content": msg.content or "", "tool_calls": []}
-                for tc in msg.tool_calls:
-                    assistant_payload["tool_calls"].append({"id": tc.id, "type": tc.type, "function": {"name": tc.function.name, "arguments": tc.function.arguments}})
+        for _ in range(6):
+            resp = _llm_chat_create(analyzer, ai_conf, messages=messages_for_model, tools=tools, tool_choice="auto", timeout_s=35)
+            msg = _llm_extract_message(resp)
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                assistant_payload: Dict[str, Any] = {"role": "assistant", "content": msg.get("content") or "", "tool_calls": tool_calls}
+                rc = (msg.get("reasoning_content") or "").strip()
+                if rc:
+                    assistant_payload["reasoning_content"] = rc
                 messages_for_model.append(assistant_payload)
 
-                for tc in msg.tool_calls:
-                    name = tc.function.name
-                    args_raw = tc.function.arguments or "{}"
+                for tc in tool_calls:
+                    name = ((tc or {}).get("function") or {}).get("name")
+                    args_raw = (((tc or {}).get("function") or {}).get("arguments")) or "{}"
                     try:
                         args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
                     except Exception:
@@ -2817,13 +3111,22 @@ async def agent_run_step(req: AgentRunStepRequest):
                         err = str(e)[:300]
                         result = {"ok": False, "error": err}
 
-                    tool_calls_log.append({"tool": name, "ok": ok, "dt_ms": int((time.perf_counter() - t0) * 1000), "error": err})
+                    if ok and isinstance(result, dict) and (result.get("ok") is False):
+                        ok = False
+                        err = str(result.get("error") or "未知错误")[:300]
+
+                    out_excerpt = None
+                    if isinstance(result, dict) and isinstance(result.get("output"), str) and result.get("output"):
+                        out_excerpt = (result.get("output") or "")[:900]
+                    tool_calls_log.append(
+                        {"tool": name, "ok": ok, "dt_ms": int((time.perf_counter() - t0) * 1000), "error": err, "output_excerpt": out_excerpt}
+                    )
                     last_tool_ok = bool(ok)
                     last_tool_error = err
-                    messages_for_model.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, ensure_ascii=False)})
+                    messages_for_model.append({"role": "tool", "tool_call_id": (tc or {}).get("id"), "content": json.dumps(result, ensure_ascii=False)})
                 continue
 
-            summary = msg.content or ""
+            summary = _strip_dsml(msg.get("content") or "")
             step_dt_ms = int((time.perf_counter() - step_t0) * 1000)
             if last_tool_ok is False:
                 step["status"] = "failed"
@@ -2844,7 +3147,36 @@ async def agent_run_step(req: AgentRunStepRequest):
                 _save_persisted_state()
             return {"session_id": session.get("id"), "run": run, "events": session.get("events") or []}
 
-        raise RuntimeError("步骤执行未能收敛")
+        messages_for_model.append(
+            {
+                "role": "system",
+                "content": "不要再调用任何工具。请基于已有的工具返回结果，用中文给出本步骤的最终执行摘要（summary）。",
+            }
+        )
+        resp2 = _llm_chat_create(analyzer, ai_conf, messages=messages_for_model, tools=[], tool_choice="none", timeout_s=35)
+        msg2 = _llm_extract_message(resp2)
+        summary2 = _strip_dsml((msg2.get("content") or "").strip())
+        step_dt_ms = int((time.perf_counter() - step_t0) * 1000)
+        if last_tool_ok is False:
+            step["status"] = "failed"
+            summary2 = f"步骤执行失败：{(last_tool_error or '未知错误')}"
+            _agent_add_event(session, "step_failed", {"run_id": run.get("id"), "step_index": idx, "dt_ms": step_dt_ms, "error": (last_tool_error or "")[:240]})
+        else:
+            step["status"] = "done"
+            if not summary2:
+                summary2 = "已执行命令并完成本步骤。"
+        step["ended_at"] = _agent_now_iso()
+        step["summary"] = summary2[:1200]
+        step["tool_log"] = tool_calls_log
+        run["updated_at"] = _agent_now_iso()
+        if step["status"] == "done":
+            _agent_add_event(session, "step_done", {"run_id": run.get("id"), "step_index": idx, "dt_ms": step_dt_ms})
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(asyncio.to_thread(_save_persisted_state))
+        except RuntimeError:
+            _save_persisted_state()
+        return {"session_id": session.get("id"), "run": run, "events": session.get("events") or []}
     except Exception as e:
         step_dt_ms = int((time.perf_counter() - step_t0) * 1000) if "step_t0" in locals() else None
         step["status"] = "failed"
@@ -2996,6 +3328,32 @@ async def agent_chat(req: AgentChatRequest):
     tool_log: List[Dict[str, Any]] = []
     created_skill_ids: List[str] = []
 
+    def _extract_reasoning_content(message: Any) -> Optional[str]:
+        if message is None:
+            return None
+        for attr in ("reasoning_content", "reasoning"):
+            try:
+                v = getattr(message, attr, None)
+                if isinstance(v, str) and v.strip():
+                    return v
+            except Exception:
+                pass
+        try:
+            d = message.model_dump()
+            v = d.get("reasoning_content") or d.get("reasoning")
+            if isinstance(v, str) and v.strip():
+                return v
+        except Exception:
+            pass
+        try:
+            d = getattr(message, "__dict__", {}) or {}
+            v = d.get("reasoning_content") or d.get("reasoning")
+            if isinstance(v, str) and v.strip():
+                return v
+        except Exception:
+            pass
+        return None
+
     def _tool_list_devices():
         return {"devices": allowed_devices}
 
@@ -3012,6 +3370,9 @@ async def agent_chat(req: AgentChatRequest):
     async def _tool_run_device_commands(device_id: str, commands: List[str]):
         if str(device_id) not in set(allowed_ids):
             raise ValueError("DENY_DEVICE: device_id 不在允许列表中")
+        commands = [str(x).strip() for x in (commands or []) if str(x).strip()]
+        if not commands:
+            raise ValueError("PARAM_INVALID: commands 不能为空")
         if not req.allow_config:
             for c in commands:
                 if not _looks_readonly_command(c):
@@ -3030,7 +3391,27 @@ async def agent_chat(req: AgentChatRequest):
         _agent_add_event(session, "tool_start", {"tool": "run_device_commands", "device_id": device_id, "commands": cmds_safe})
         t0 = time.perf_counter()
         try:
-            output = await asyncio.to_thread(adapter.execute_commands, commands)
+            def _strip_mode_cmds(brand: str, cmds: List[str]) -> List[str]:
+                b = (brand or "").strip().lower()
+                if b == "h3c":
+                    drop = {"system-view", "return"}
+                    return [c for c in cmds if c.strip().lower() not in drop]
+                return cmds
+
+            readonly_cmds = [c for c in commands if _looks_readonly_command(c)]
+            config_cmds = [c for c in commands if not _looks_readonly_command(c)]
+            parts: List[str] = []
+            if bool(req.allow_config) and config_cmds:
+                config_cmds = _strip_mode_cmds(getattr(dev, "brand", "") or "", config_cmds)
+                if config_cmds:
+                    out_cfg = await asyncio.to_thread(adapter.execute_commands, config_cmds, True)
+                    if out_cfg:
+                        parts.append(str(out_cfg))
+            if readonly_cmds:
+                out_ro = await asyncio.to_thread(adapter.execute_commands, readonly_cmds, False)
+                if out_ro:
+                    parts.append(str(out_ro))
+            output = "\n".join(parts).strip()
             _agent_add_event(
                 session,
                 "tool_end",
@@ -3094,8 +3475,9 @@ async def agent_chat(req: AgentChatRequest):
 
     plan = None
     try:
-        plan_resp = analyzer.client.chat.completions.create(
-            model=ai_conf.model,
+        plan_resp = _llm_chat_create(
+            analyzer,
+            ai_conf,
             messages=messages_for_model
             + [
                 {
@@ -3105,9 +3487,10 @@ async def agent_chat(req: AgentChatRequest):
                 }
             ],
             response_format={"type": "json_object"},
-            timeout=25,
+            timeout_s=25,
         )
-        plan_raw = plan_resp.choices[0].message.content or "{}"
+        plan_msg = _llm_extract_message(plan_resp)
+        plan_raw = plan_msg.get("content") or "{}"
         plan = json.loads(plan_raw) if isinstance(plan_raw, str) else plan_raw
     except Exception as e:
         tool_log.append({"tool": "plan", "ok": False, "dt_ms": 0, "args": {}, "error": str(e)[:240]})
@@ -3131,13 +3514,7 @@ async def agent_chat(req: AgentChatRequest):
 
     for _ in range(3):
         try:
-            resp = analyzer.client.chat.completions.create(
-                model=ai_conf.model,
-                messages=messages_for_model,
-                tools=tools,
-                tool_choice="auto",
-                timeout=35,
-            )
+            resp = _llm_chat_create(analyzer, ai_conf, messages=messages_for_model, tools=tools, tool_choice="auto", timeout_s=35)
         except Exception as e:
             tool_log.append(
                 {
@@ -3148,27 +3525,19 @@ async def agent_chat(req: AgentChatRequest):
                     "error": str(e)[:300],
                 }
             )
-            resp = analyzer.client.chat.completions.create(
-                model=ai_conf.model,
-                messages=messages_for_model,
-                timeout=35,
-            )
-        msg = resp.choices[0].message
-        if getattr(msg, "tool_calls", None):
-            assistant_payload: Dict[str, Any] = {"role": "assistant", "content": msg.content or "", "tool_calls": []}
-            for tc in msg.tool_calls:
-                assistant_payload["tool_calls"].append(
-                    {
-                        "id": tc.id,
-                        "type": tc.type,
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                )
+            resp = _llm_chat_create(analyzer, ai_conf, messages=messages_for_model, timeout_s=35)
+        msg = _llm_extract_message(resp)
+        tool_calls = msg.get("tool_calls") or []
+        if tool_calls:
+            assistant_payload: Dict[str, Any] = {"role": "assistant", "content": msg.get("content") or "", "tool_calls": tool_calls}
+            rc = (msg.get("reasoning_content") or "").strip()
+            if rc:
+                assistant_payload["reasoning_content"] = rc
             messages_for_model.append(assistant_payload)
 
-            for tc in msg.tool_calls:
-                name = tc.function.name
-                args_raw = tc.function.arguments or "{}"
+            for tc in tool_calls:
+                name = ((tc or {}).get("function") or {}).get("name")
+                args_raw = (((tc or {}).get("function") or {}).get("arguments")) or "{}"
                 try:
                     args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
                 except Exception:
@@ -3222,13 +3591,13 @@ async def agent_chat(req: AgentChatRequest):
                 messages_for_model.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tc.id,
+                        "tool_call_id": (tc or {}).get("id"),
                         "content": json.dumps(result, ensure_ascii=False),
                     }
                 )
             continue
 
-        final_text = msg.content or ""
+        final_text = msg.get("content") or ""
         if isinstance(run, dict) and isinstance(run.get("steps"), list):
             for s in run["steps"]:
                 if s.get("status") == "pending":

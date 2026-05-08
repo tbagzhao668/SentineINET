@@ -1,11 +1,149 @@
 import openai
 import json
+import re
+from typing import Any, Dict, List, Optional, Callable
+
+import httpx
 
 class AIAnalyzer:
     def __init__(self, api_key, model="gpt-4", base_url=None):
         self.api_key = api_key
         self.model = model
+        self.base_url = base_url
         self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
+
+    def _should_use_raw_http(self) -> bool:
+        bu = (self.base_url or "").strip().lower()
+        m = (self.model or "").strip().lower()
+        if "api.deepseek.com" in bu:
+            return True
+        if m.startswith("deepseek-"):
+            return True
+        return False
+
+    def _raw_chat_completions_create(self, payload: Dict[str, Any], timeout_s: Optional[float]) -> Dict[str, Any]:
+        base = (self.base_url or "https://api.openai.com/v1").rstrip("/")
+        url = base + "/chat/completions"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        with httpx.Client(timeout=float(timeout_s or 35)) as client:
+            r = client.post(url, headers=headers, json=payload)
+            if r.status_code >= 400:
+                try:
+                    raise RuntimeError(f"Error code: {r.status_code} - {r.json()}")
+                except Exception:
+                    raise RuntimeError(f"Error code: {r.status_code} - {r.text[:800]}")
+            return r.json()
+
+    def _chat_create(self, *, messages: List[Dict[str, Any]], response_format: Optional[Dict[str, Any]] = None, timeout_s: Optional[float] = None) -> Any:
+        if self._should_use_raw_http():
+            payload: Dict[str, Any] = {"model": self.model, "messages": messages, "stream": False}
+            if response_format is not None:
+                payload["response_format"] = response_format
+            return self._raw_chat_completions_create(payload=payload, timeout_s=timeout_s)
+        kwargs: Dict[str, Any] = {"model": self.model, "messages": messages, "timeout": timeout_s}
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        return self.client.chat.completions.create(**kwargs)
+
+    def _extract_content(self, resp: Any) -> str:
+        try:
+            if isinstance(resp, dict):
+                return (((resp.get("choices") or [])[0] or {}).get("message") or {}).get("content") or ""
+            return resp.choices[0].message.content or ""
+        except Exception:
+            return ""
+
+    def _strip_dsml(self, text: str) -> str:
+        t = text or ""
+        if "<｜DSML｜" not in t:
+            return t.strip()
+        t = re.sub(r"<｜DSML｜[\s\S]*?>", "", t)
+        t = re.sub(r"</｜DSML｜[\s\S]*?>", "", t)
+        return t.strip()
+
+    def _json_with_retry(
+        self,
+        *,
+        base_messages: List[Dict[str, Any]],
+        validator: Callable[[Any], Optional[str]],
+        timeout_s: Optional[float],
+        max_attempts: int = 4,
+    ) -> Dict[str, Any]:
+        last_err = ""
+        last_raw = ""
+        for _ in range(max(1, int(max_attempts))):
+            messages = list(base_messages)
+            if last_err:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": f"上一次输出不符合要求：{last_err}。请严格输出 JSON 对象，不要包含任何多余文字。",
+                    }
+                )
+                if last_raw.strip():
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": f"上一次输出原文片段（供你纠错）：{last_raw[:600]}",
+                        }
+                    )
+            resp = self._chat_create(messages=messages, response_format={"type": "json_object"}, timeout_s=timeout_s)
+            raw = self._strip_dsml(self._extract_content(resp))
+            last_raw = raw
+            try:
+                obj = json.loads(raw or "{}")
+            except Exception as e:
+                last_err = f"JSON 解析失败：{str(e)[:180]}"
+                continue
+            err = validator(obj)
+            if err:
+                last_err = err[:220]
+                continue
+            return obj
+        raise RuntimeError(last_err or "LLM 输出未通过校验")
+
+    def _lines_with_retry(
+        self,
+        *,
+        base_messages: List[Dict[str, Any]],
+        validator: Callable[[List[str], str], Optional[str]],
+        timeout_s: Optional[float],
+        max_attempts: int = 4,
+    ) -> List[str]:
+        last_err = ""
+        last_raw = ""
+        for _ in range(max(1, int(max_attempts))):
+            messages = list(base_messages)
+            if last_err:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": f"上一次输出不符合要求：{last_err}。现在只输出命令本身，每行一条，不要解释。",
+                    }
+                )
+                if last_raw.strip():
+                    messages.append({"role": "system", "content": f"上一次输出原文片段（供你纠错）：{last_raw[:600]}"})
+            resp = self._chat_create(messages=messages, timeout_s=timeout_s)
+            raw = self._strip_dsml(self._extract_content(resp))
+            raw = raw.replace("```bash", "").replace("```", "").strip()
+            last_raw = raw
+            lines = []
+            for line in (raw or "").splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                s = re.sub(r"^\s*[\-\*\d]+[.)]\s*", "", s).strip()
+                if not s:
+                    continue
+                if any(ch in s for ch in ("：", "，")) and (" " not in s):
+                    continue
+                lines.append(s)
+            err = validator(lines, raw)
+            if err:
+                last_err = err[:220]
+                continue
+            return lines
+        raise RuntimeError(last_err or "LLM 输出未通过校验")
 
     def analyze_logs(self, log_content, brand, timeout_s=None):
         """分析日志并生成风险报告"""
@@ -23,18 +161,28 @@ class AIAnalyzer:
             "summary": "简短的总结报告"
         }}
         """
-        
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"日志内容：\n{log_content}"}
-            ],
-            response_format={ "type": "json_object" },
-            timeout=timeout_s,
+
+        def _validate(obj: Any) -> Optional[str]:
+            if not isinstance(obj, dict):
+                return "输出不是 JSON 对象"
+            if not isinstance(obj.get("risks"), list):
+                return "risks 必须是数组"
+            if not isinstance(obj.get("summary"), str):
+                return "summary 必须是字符串"
+            for r in (obj.get("risks") or [])[:20]:
+                if not isinstance(r, dict):
+                    return "risks 项必须是对象"
+                for k in ("ip", "type", "level", "reason"):
+                    v = r.get(k)
+                    if not isinstance(v, str) or not v.strip():
+                        return f"risks 项缺少或无效字段：{k}"
+            return None
+
+        return self._json_with_retry(
+            base_messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"日志内容：\n{log_content}"}],
+            validator=_validate,
+            timeout_s=timeout_s,
         )
-        
-        return json.loads(response.choices[0].message.content)
 
     def analyze_alarms(self, log_content, brand, device_version=None, timeout_s=None):
         version_text = (device_version or "").strip() or "未知"
@@ -57,17 +205,27 @@ class AIAnalyzer:
         }}
         """
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"日志内容：\n{log_content}"}
-            ],
-            response_format={ "type": "json_object" },
-            timeout=timeout_s,
-        )
+        def _validate(obj: Any) -> Optional[str]:
+            if not isinstance(obj, dict):
+                return "输出不是 JSON 对象"
+            if not isinstance(obj.get("alarms"), list):
+                return "alarms 必须是数组"
+            if not isinstance(obj.get("summary"), str):
+                return "summary 必须是字符串"
+            for a in (obj.get("alarms") or [])[:30]:
+                if not isinstance(a, dict):
+                    return "alarms 项必须是对象"
+                for k in ("time", "type", "level", "target", "reason", "suggestion"):
+                    v = a.get(k)
+                    if not isinstance(v, str) or not v.strip():
+                        return f"alarms 项缺少或无效字段：{k}"
+            return None
 
-        return json.loads(response.choices[0].message.content)
+        return self._json_with_retry(
+            base_messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"日志内容：\n{log_content}"}],
+            validator=_validate,
+            timeout_s=timeout_s,
+        )
 
     def analyze_topology(self, lldp_payload, seed_brand_hint=None, timeout_s=None):
         system_prompt = f"""
@@ -89,16 +247,36 @@ class AIAnalyzer:
         """
 
         user_content = json.dumps({"seed_brand_hint": seed_brand_hint, "devices": lldp_payload}, ensure_ascii=False)
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            response_format={ "type": "json_object" },
-            timeout=timeout_s,
+        def _validate(obj: Any) -> Optional[str]:
+            if not isinstance(obj, dict):
+                return "输出不是 JSON 对象"
+            if not isinstance(obj.get("nodes"), list):
+                return "nodes 必须是数组"
+            if not isinstance(obj.get("links"), list):
+                return "links 必须是数组"
+            if not isinstance(obj.get("summary"), str):
+                return "summary 必须是字符串"
+            for n in (obj.get("nodes") or [])[:80]:
+                if not isinstance(n, dict):
+                    return "nodes 项必须是对象"
+                if not isinstance(n.get("id"), str) or not n.get("id").strip():
+                    return "nodes.id 必须是字符串"
+                if not isinstance(n.get("label"), str) or not n.get("label").strip():
+                    return "nodes.label 必须是字符串"
+            for l in (obj.get("links") or [])[:120]:
+                if not isinstance(l, dict):
+                    return "links 项必须是对象"
+                if not isinstance(l.get("source"), str) or not l.get("source").strip():
+                    return "links.source 必须是字符串"
+                if not isinstance(l.get("target"), str) or not l.get("target").strip():
+                    return "links.target 必须是字符串"
+            return None
+
+        return self._json_with_retry(
+            base_messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
+            validator=_validate,
+            timeout_s=timeout_s,
         )
-        return json.loads(response.choices[0].message.content)
 
     def generate_block_commands(self, ips, brand):
         """根据 IP 和品牌生成封堵命令"""
@@ -106,19 +284,23 @@ class AIAnalyzer:
         你是一个网络配置助手。请为 {brand} 防火墙生成封堵以下 IP 的命令。
         只需输出命令列表，每行一条。不要包含任何解释性文字或 Markdown 格式。
         """
-        
-        ip_list = ", ".join(ips)
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"需要封堵的 IP: {ip_list}"}
-            ]
+
+        def _validate(lines: List[str], raw: str) -> Optional[str]:
+            if not lines:
+                return "没有输出任何命令"
+            if "```" in (raw or ""):
+                return "包含 Markdown 代码块"
+            bad = ("解释", "说明", "如下", "命令", "建议", "json", "{", "}")
+            if any(x in (raw or "") for x in bad):
+                return "包含解释性文字"
+            return None
+
+        ip_list = ", ".join([str(x).strip() for x in (ips or []) if str(x).strip()])
+        return self._lines_with_retry(
+            base_messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"需要封堵的 IP: {ip_list}"}],
+            validator=_validate,
+            timeout_s=None,
         )
-        
-        # 将输出按行分割成列表
-        commands = [line.strip() for line in response.choices[0].message.content.split('\n') if line.strip()]
-        return commands
 
     def generate_commands_by_intent(self, intent, brand, device_version=None):
         """根据用户的意图（如：获取 CPU、内存、日志等）和设备品牌生成对应的 CLI 命令"""
@@ -135,19 +317,21 @@ class AIAnalyzer:
         3. 确保命令是只读的（巡检类）或配置类的，取决于意图。
         4. 如果不同版本命令存在差异，请优先生成适配该版本的命令。
         """
-        
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"意图：{intent}"}
-            ]
+
+        def _validate(lines: List[str], raw: str) -> Optional[str]:
+            if not lines:
+                return "没有输出任何命令"
+            if "```" in (raw or ""):
+                return "包含 Markdown 代码块"
+            if any(x in (raw or "") for x in ("解释", "说明", "原因", "如下", "建议", "这里是", "输出")):
+                return "包含解释性文字"
+            return None
+
+        return self._lines_with_retry(
+            base_messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"意图：{intent}"}],
+            validator=_validate,
+            timeout_s=None,
         )
-        
-        content = response.choices[0].message.content.strip()
-        # 移除可能的 markdown 块
-        content = content.replace("```", "").replace("```bash", "").strip()
-        return [line.strip() for line in content.split('\n') if line.strip()]
 
     def generate_backup_command_templates(self, brand, device_version=None, protocol="tftp", timeout_s=None):
         version_text = (device_version or "").strip() or "未知"
@@ -175,14 +359,39 @@ class AIAnalyzer:
 
         user_prompt = "请给出可执行的命令模板。"
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            timeout=timeout_s,
-        )
+        def _validate(obj: Any) -> Optional[str]:
+            if not isinstance(obj, dict):
+                return "输出不是 JSON 对象"
+            if set(obj.keys()) - {"commands", "prerequisites", "tags"}:
+                return "只能包含 keys: commands, prerequisites, tags"
+            cmds = obj.get("commands")
+            if not isinstance(cmds, list) or not (1 <= len(cmds) <= 6):
+                return "commands 必须是 1-6 条的数组"
+            for c in cmds:
+                if not isinstance(c, str) or not c.strip():
+                    return "commands 每条必须是非空字符串"
+                if "\n" in c:
+                    return "commands 每条必须是单行命令"
+            pre = obj.get("prerequisites")
+            if pre is not None and not isinstance(pre, list):
+                return "prerequisites 必须是数组"
+            if isinstance(pre, list):
+                for x in pre:
+                    if not isinstance(x, str):
+                        return "prerequisites 只能包含字符串"
+            tags = obj.get("tags")
+            if tags is not None and not isinstance(tags, list):
+                return "tags 必须是数组"
+            if isinstance(tags, list):
+                low = [str(x).strip().lower() for x in tags if str(x).strip()]
+                if "backup" not in low:
+                    return "tags 必须包含 backup"
+                if p not in low:
+                    return f"tags 必须包含协议名：{p}"
+            return None
 
-        return json.loads(response.choices[0].message.content)
+        return self._json_with_retry(
+            base_messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            validator=_validate,
+            timeout_s=timeout_s,
+        )

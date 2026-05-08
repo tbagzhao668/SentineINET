@@ -63,6 +63,11 @@ class FirewallAdapter:
         try:
             with socket.create_connection((host, port), timeout=3) as sock:
                 sock.settimeout(1.5)
+                if self.protocol == "ssh":
+                    try:
+                        sock.sendall(b"SSH-2.0-SentinelNet\r\n")
+                    except Exception:
+                        pass
                 try:
                     data = sock.recv(64)
                 except Exception:
@@ -171,6 +176,9 @@ class FirewallAdapter:
         """执行任意 CLI 命令列表"""
         if isinstance(commands, str):
             commands = [commands]
+        commands = [str(x).strip() for x in (commands or []) if str(x).strip()]
+        if not commands:
+            return ""
 
         if (not is_config) and self.protocol == "telnet":
             username = str(self.connection_params.get("username") or "").strip()
@@ -182,6 +190,61 @@ class FirewallAdapter:
         for attempt in range(2):
             try:
                 with self._connect() as conn:
+                    if self.brand == "H3C":
+                        outputs = []
+                        if is_config:
+                            outputs.append(
+                                conn.send_command_timing(
+                                    "system-view",
+                                    strip_prompt=False,
+                                    strip_command=False,
+                                    delay_factor=2,
+                                    max_loops=240,
+                                )
+                            )
+                            for cmd in commands:
+                                if cmd.strip().lower().startswith("save"):
+                                    outputs.append(
+                                        conn.send_command_timing(
+                                            "return",
+                                            strip_prompt=False,
+                                            strip_command=False,
+                                            delay_factor=2,
+                                            max_loops=240,
+                                        )
+                                    )
+                                outputs.append(
+                                    conn.send_command_timing(
+                                        cmd,
+                                        strip_prompt=False,
+                                        strip_command=False,
+                                        delay_factor=2,
+                                        max_loops=240,
+                                    )
+                                )
+                            outputs.append(
+                                conn.send_command_timing(
+                                    "return",
+                                    strip_prompt=False,
+                                    strip_command=False,
+                                    delay_factor=2,
+                                    max_loops=240,
+                                )
+                            )
+                            return "\n".join([x for x in outputs if x])
+
+                        for cmd in commands:
+                            outputs.append(
+                                conn.send_command_timing(
+                                    cmd,
+                                    strip_prompt=False,
+                                    strip_command=False,
+                                    delay_factor=2,
+                                    max_loops=240,
+                                )
+                            )
+                        return "\n".join([x for x in outputs if x])
+
                     if is_config:
                         if hasattr(conn, "enable"):
                             conn.enable()
