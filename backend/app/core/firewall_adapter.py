@@ -40,18 +40,30 @@ class FirewallAdapter:
         base_device_type = self.BRAND_MAP.get(brand, "generic_ssh")
         # 如果是 Telnet，Netmiko 通常需要在 device_type 后加 _telnet
         self.device_type = f"{base_device_type}_telnet" if self.protocol == "telnet" else base_device_type
+
+        resolved_port = port
+        try:
+            if resolved_port is None:
+                resolved_port = 0
+            if isinstance(resolved_port, str) and (not resolved_port.strip()):
+                resolved_port = 0
+            resolved_port = int(resolved_port)
+        except Exception:
+            resolved_port = 0
+        if resolved_port <= 0:
+            resolved_port = 23 if self.protocol == "telnet" else 22
         
         self.connection_params = {
             "device_type": self.device_type,
             "host": host,
             "username": username or "",
             "password": password or "",
-            "port": port,
+            "port": resolved_port,
             "secret": secret,
-            "timeout": 10,
-            "conn_timeout": 6,
+            "timeout": 12,
+            "conn_timeout": 15,
             "auth_timeout": 10,
-            "banner_timeout": 10,
+            "banner_timeout": 15,
             "blocking_timeout": 10,
         }
 
@@ -62,7 +74,7 @@ class FirewallAdapter:
             return
         try:
             with socket.create_connection((host, port), timeout=3) as sock:
-                sock.settimeout(1.5)
+                sock.settimeout(3.0)
                 if self.protocol == "ssh":
                     try:
                         sock.sendall(b"SSH-2.0-SentinelNet\r\n")
@@ -80,12 +92,18 @@ class FirewallAdapter:
                 f"目标端口返回 SSH banner（{data[:32].decode(errors='ignore')}），但当前设备协议设置为 telnet。"
                 f"请改为 ssh，或改用 telnet 端口（通常为 23）。"
             )
-        if self.protocol == "ssh" and data and (not data.startswith(b"SSH-")):
-            hint = data[:32].decode(errors="ignore")
-            raise RuntimeError(
-                f"目标端口未返回 SSH banner（收到：{hint!r}），但当前设备协议设置为 ssh。"
-                f"请检查端口/协议是否应为 telnet，或设备 SSH 服务是否开启。"
-            )
+        if self.protocol == "ssh":
+            if not data:
+                raise RuntimeError(
+                    f"目标端口未返回 SSH banner（未收到任何数据），但当前设备协议设置为 ssh。"
+                    f"请检查端口/协议是否应为 telnet，或设备 SSH 服务是否开启。"
+                )
+            if not data.startswith(b"SSH-"):
+                hint = data[:32].decode(errors="ignore")
+                raise RuntimeError(
+                    f"目标端口未返回 SSH banner（收到：{hint!r}），但当前设备协议设置为 ssh。"
+                    f"请检查端口/协议是否应为 telnet，或设备 SSH 服务是否开启。"
+                )
 
     def _connect(self):
         self._precheck_protocol()
@@ -180,10 +198,17 @@ class FirewallAdapter:
         if not commands:
             return ""
 
-        if (not is_config) and self.protocol == "telnet":
+        if self.protocol == "telnet":
             username = str(self.connection_params.get("username") or "").strip()
             password = str(self.connection_params.get("password") or "").strip()
             if (not username) and (not password):
+                if is_config and self.brand == "H3C":
+                    normalized = [str(x).strip() for x in commands if str(x).strip()]
+                    has_system_view = any(str(x).lower().replace(" ", "") in ("system-view", "systemview") for x in normalized)
+                    if not has_system_view:
+                        commands = ["system-view"] + normalized + ["return"]
+                    else:
+                        commands = normalized
                 return self._execute_telnet_noauth(commands)
 
         last_err = None
@@ -268,6 +293,21 @@ class FirewallAdapter:
                             results.append(conn.send_command(cmd, cmd_verify=False, read_timeout=30))
                     return "\n".join(results)
             except Exception as e:
+                if self.protocol == "telnet":
+                    msg0 = str(e) or ""
+                    if "pattern not detected" in msg0.lower():
+                        fallback_cmds = commands
+                        if is_config and self.brand == "H3C":
+                            normalized = [str(x).strip() for x in commands if str(x).strip()]
+                            has_system_view = any(str(x).lower().replace(" ", "") in ("system-view", "systemview") for x in normalized)
+                            if not has_system_view:
+                                fallback_cmds = ["system-view"] + normalized + ["return"]
+                            else:
+                                fallback_cmds = normalized
+                        try:
+                            return self._execute_telnet_noauth(fallback_cmds)
+                        except Exception:
+                            pass
                 last_err = e
                 msg = str(e).lower()
                 retryable = any(x in msg for x in ["timed out", "timeout", "eof", "socket", "connection reset", "not responding", "reset by peer"])

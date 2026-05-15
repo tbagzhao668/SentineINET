@@ -138,7 +138,7 @@ class DeviceConfig(BaseModel):
     id: Optional[str] = None
     brand: str
     host: str
-    port: int = 22
+    port: Optional[int] = None
     protocol: str = "ssh" # "ssh" 或 "telnet"
     alias: Optional[str] = None
     username: Optional[str] = ""
@@ -283,7 +283,25 @@ def _load_persisted_state():
     loaded_devices = {}
     for device_id, dev_data in devices_raw.items():
         try:
-            loaded_devices[device_id] = DeviceConfig(**dev_data)
+            dev = DeviceConfig(**dev_data)
+            dev.host = (dev.host or "").strip()
+            dev.protocol = (dev.protocol or "ssh").strip().lower()
+            dev.username = (dev.username or "").strip()
+            dev.password = (dev.password or "").strip()
+            device_id_str = str(device_id or "").strip()
+            if (not getattr(dev, "port", None)) and ":" in device_id_str:
+                tail = device_id_str.rsplit(":", 1)[-1].strip()
+                try:
+                    tail_port = int(tail)
+                    if 1 <= tail_port <= 65535:
+                        dev.port = tail_port
+                except Exception:
+                    pass
+            if (not getattr(dev, "port", None)) or int(dev.port or 0) <= 0:
+                dev.port = 23 if dev.protocol == "telnet" else 22
+            if not (getattr(dev, "id", None) or "").strip():
+                dev.id = device_id_str or f"{dev.host}:{dev.port}"
+            loaded_devices[device_id_str or dev.id] = dev
         except Exception:
             continue
     if loaded_devices:
@@ -2075,9 +2093,17 @@ async def get_all_devices_status():
 
 @app.post("/devices")
 async def add_device(device: DeviceConfig):
-    device.host = device.host.strip()
+    device.host = (device.host or "").strip()
+    device.protocol = (device.protocol or "ssh").strip().lower()
     device.username = (device.username or "").strip()
     device.password = (device.password or "").strip()
+    try:
+        device_port = int(device.port or 0)
+    except Exception:
+        device_port = 0
+    if device_port <= 0:
+        device_port = 23 if device.protocol == "telnet" else 22
+    device.port = device_port
     device_id = (device.id or f"{device.host}:{device.port}").strip()
     device.id = device_id
     if device_id in db["devices"]:
@@ -3206,8 +3232,15 @@ async def agent_chat(req: AgentChatRequest):
     session = _agent_get_or_create_session(req.session_id, req.device_ids, bool(req.allow_config))
     session_id = session.get("id")
 
-    allowed_devices = _sanitize_devices_for_agent(req.device_ids)
+    requested_ids: Optional[List[str]] = None
+    if req.device_ids is not None:
+        requested_ids = [str(x).strip() for x in (req.device_ids or []) if str(x).strip()]
+    allowed_devices = _sanitize_devices_for_agent(requested_ids)
     allowed_ids = [d["id"] for d in allowed_devices]
+    missing_ids: List[str] = []
+    if requested_ids is not None:
+        existing = set([str(x) for x in (db.get("devices", {}) or {}).keys()])
+        missing_ids = [x for x in requested_ids if x not in existing]
 
     latest_user_text = ""
     for m in reversed(req.messages or []):
@@ -3238,6 +3271,8 @@ async def agent_chat(req: AgentChatRequest):
                 {
                     "session_id": session_id,
                     "allow_config": bool(req.allow_config),
+                    "requested_device_ids": requested_ids,
+                    "missing_device_ids": missing_ids,
                     "allowed_device_ids": allowed_ids,
                     "devices": allowed_devices,
                     "memory": session.get("memory") or {},
@@ -3512,7 +3547,10 @@ async def agent_chat(req: AgentChatRequest):
             _agent_add_event(session, "assistant", {"text": msg[:400]})
             return {"session_id": session_id, "run": run, "plan": plan, "events": session.get("events") or [], "message": msg, "tool_log": tool_log, "skills_saved": created_skill_ids}
 
-    for _ in range(3):
+    last_tool_ok: Optional[bool] = None
+    last_tool_error: Optional[str] = None
+
+    for _ in range(8):
         try:
             resp = _llm_chat_create(analyzer, ai_conf, messages=messages_for_model, tools=tools, tool_choice="auto", timeout_s=35)
         except Exception as e:
@@ -3577,6 +3615,9 @@ async def agent_chat(req: AgentChatRequest):
                     ok = False
                     err = str(e)[:300]
                     result = {"ok": False, "error": err}
+                if ok and isinstance(result, dict) and (result.get("ok") is False):
+                    ok = False
+                    err = str(result.get("error") or "未知错误")[:300]
 
                 tool_log.append(
                     {
@@ -3587,6 +3628,8 @@ async def agent_chat(req: AgentChatRequest):
                         "error": err,
                     }
                 )
+                last_tool_ok = bool(ok)
+                last_tool_error = err
 
                 messages_for_model.append(
                     {
@@ -3605,26 +3648,39 @@ async def agent_chat(req: AgentChatRequest):
                     s["started_at"] = s.get("started_at") or _agent_now_iso()
                     s["ended_at"] = _agent_now_iso()
                     s["summary"] = "自动执行模式：步骤合并执行完成"
-            run["status"] = "done"
+            run["status"] = "failed" if (last_tool_ok is False) else "done"
             run["updated_at"] = _agent_now_iso()
+        if last_tool_ok is False:
+            final_text = f"执行失败：{(last_tool_error or '未知错误')}"
         _agent_add_message(session, "assistant", final_text)
         _agent_add_event(session, "assistant", {"text": final_text[:400]})
         return {"session_id": session_id, "run": run, "plan": plan, "events": session.get("events") or [], "message": final_text, "tool_log": tool_log, "skills_saved": created_skill_ids}
 
-    msg = "AI 工具调用循环未能收敛，我已停止继续自动调用工具。建议：缩小设备范围（选择单台设备）、把需求拆成更小的步骤，或关闭自动执行改为逐步执行。"
-    if isinstance(run, dict):
-        run["status"] = "failed"
+    messages_for_model.append(
+        {
+            "role": "system",
+            "content": "不要再调用任何工具。请基于已获得的工具返回结果，用中文给出最终回复：说明执行了哪些设备/命令、关键输出结论、是否成功、以及下一步建议。",
+        }
+    )
+    resp2 = _llm_chat_create(analyzer, ai_conf, messages=messages_for_model, tools=[], tool_choice="none", timeout_s=35)
+    msg2 = _llm_extract_message(resp2)
+    final_text2 = (msg2.get("content") or "").strip()
+    if isinstance(run, dict) and isinstance(run.get("steps"), list):
+        for s in run["steps"]:
+            if s.get("status") == "pending":
+                s["status"] = "done" if (last_tool_ok is not False) else "skipped"
+                s["started_at"] = s.get("started_at") or _agent_now_iso()
+                s["ended_at"] = _agent_now_iso()
+                s["summary"] = "自动执行模式：步骤合并执行完成" if (last_tool_ok is not False) else "由于执行失败，本步骤未自动执行"
+        run["status"] = "failed" if (last_tool_ok is False) else "done"
         run["updated_at"] = _agent_now_iso()
-        steps = run.get("steps")
-        if isinstance(steps, list):
-            for s in steps:
-                if s.get("status") == "pending":
-                    s["status"] = "skipped"
-                    s["summary"] = "由于工具调用未收敛，本步骤未自动执行"
-                    s["ended_at"] = _agent_now_iso()
-    _agent_add_message(session, "assistant", msg)
-    _agent_add_event(session, "llm_not_converged", {"run_id": run.get("id") if isinstance(run, dict) else None})
-    return {"session_id": session_id, "run": run, "plan": plan, "events": session.get("events") or [], "message": msg, "tool_log": tool_log, "skills_saved": created_skill_ids}
+    if last_tool_ok is False:
+        final_text2 = f"执行失败：{(last_tool_error or '未知错误')}"
+    if not final_text2:
+        final_text2 = "已完成。"
+    _agent_add_message(session, "assistant", final_text2)
+    _agent_add_event(session, "assistant", {"text": final_text2[:400]})
+    return {"session_id": session_id, "run": run, "plan": plan, "events": session.get("events") or [], "message": final_text2, "tool_log": tool_log, "skills_saved": created_skill_ids}
 
 # --- Skill Hub 接口 ---
 

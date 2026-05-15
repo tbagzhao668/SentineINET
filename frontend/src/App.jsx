@@ -1831,7 +1831,20 @@ const App = () => {
                     <div className="grid grid-cols-2 gap-6">
                       <div className="space-y-2">
                           <label className="text-[10px] font-black text-slate-500 uppercase ml-1 tracking-widest">接入协议</label>
-                          <select value={newDevice.protocol} onChange={(e) => setNewDevice({...newDevice, protocol: e.target.value})} className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-4 text-sm outline-none focus:ring-2 focus:ring-blue-500 transition">
+                          <select
+                            value={newDevice.protocol}
+                            onChange={(e) => {
+                              const nextProtocol = e.target.value;
+                              setNewDevice((prev) => {
+                                const prevPort = Number(prev?.port || 0);
+                                let nextPort = prevPort;
+                                if (nextProtocol === "telnet" && (prevPort === 22 || prevPort <= 0)) nextPort = 23;
+                                if (nextProtocol === "ssh" && (prevPort === 23 || prevPort <= 0)) nextPort = 22;
+                                return { ...prev, protocol: nextProtocol, port: nextPort };
+                              });
+                            }}
+                            className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-4 text-sm outline-none focus:ring-2 focus:ring-blue-500 transition"
+                          >
                               <option value="ssh">SSH</option>
                               <option value="telnet">Telnet</option>
                           </select>
@@ -1875,7 +1888,10 @@ const App = () => {
                           placeholder={newDevice.protocol === "telnet" ? "23" : "22"}
                           value={newDevice.port}
                           onWheel={(e) => e.currentTarget.blur()}
-                          onChange={(e) => setNewDevice({ ...newDevice, port: parseInt(e.target.value) })}
+                          onChange={(e) => {
+                            const v = parseInt(e.target.value, 10);
+                            setNewDevice({ ...newDevice, port: Number.isFinite(v) ? v : 0 });
+                          }}
                           className="w-full bg-slate-900/80 border border-slate-700 rounded-2xl p-4 text-sm outline-none focus:ring-2 focus:ring-blue-500 transition shadow-inner"
                         />
                       </div>
