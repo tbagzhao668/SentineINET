@@ -1497,9 +1497,18 @@ const App = () => {
                                   <pre className="text-[10px] font-mono text-slate-300 whitespace-pre-wrap leading-relaxed">
                                     {toolLog.map((t, i) => {
                                       const args = (t && typeof t === "object") ? (t.args || {}) : {};
+                                      const targets = Array.isArray(args.targets) ? args.targets : [];
                                       const deviceId = args.device_id || t.device_id || "";
                                       const cmds = Array.isArray(args.commands) ? args.commands : (Array.isArray(t.commands) ? t.commands : []);
-                                      const cmdText = (deviceId && cmds.length) ? ` · ${deviceId} · ${cmds.slice(0, 6).join(" ; ")}` : "";
+                                      let cmdText = "";
+                                      if (targets.length > 0) {
+                                        const first = targets[0] || {};
+                                        const did = first.device_id || "";
+                                        const cc = Array.isArray(first.commands) ? first.commands : [];
+                                        cmdText = ` · batch(${targets.length})` + (did && cc.length ? ` · ${did} · ${cc.slice(0, 4).join(" ; ")}` : "");
+                                      } else if (deviceId && cmds.length) {
+                                        cmdText = ` · ${deviceId} · ${cmds.slice(0, 6).join(" ; ")}`;
+                                      }
                                       return `${i + 1}. ${t.tool} ${t.ok ? "ok" : "fail"} ${t.dt_ms}ms${t.error ? " · " + t.error : ""}${cmdText}`;
                                     }).join("\n")}
                                   </pre>

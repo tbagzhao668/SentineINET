@@ -3027,6 +3027,34 @@ async def agent_run_step(req: AgentRunStepRequest):
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_multi_device_commands",
+                "description": "在多台资产设备上并行执行命令。每个 target 包含 device_id 与 commands。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "targets": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 5,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "device_id": {"type": "string"},
+                                    "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                                },
+                                "required": ["device_id", "commands"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    },
+                    "required": ["targets"],
+                    "additionalProperties": False,
+                },
+            },
+        },
     ]
 
     def _tool_list_devices():
@@ -3079,6 +3107,29 @@ async def agent_run_step(req: AgentRunStepRequest):
             return {"ok": False, "error": f"DEVICE_CLI_ERROR: {cli_err}", "device_id": device_id, "commands": commands, "output": output_text}
         return {"ok": True, "device_id": device_id, "commands": commands, "output": output_text}
 
+    async def _tool_run_multi_device_commands(targets: List[Dict[str, Any]]):
+        if not isinstance(targets, list) or not targets:
+            raise ValueError("PARAM_INVALID: targets 不能为空")
+        if len(targets) > 5:
+            raise ValueError("PARAM_INVALID: targets 最多 5 个")
+        sem = asyncio.Semaphore(5)
+
+        async def _one(t: Dict[str, Any]):
+            async with sem:
+                device_id = (t or {}).get("device_id")
+                commands = (t or {}).get("commands") or []
+                try:
+                    r = await _tool_run_device_commands(device_id=device_id, commands=commands)
+                    if isinstance(r, dict) and (r.get("ok") is False):
+                        return {"ok": False, "device_id": device_id, "commands": commands, "error": r.get("error"), "output": r.get("output")}
+                    return {"ok": True, "device_id": device_id, "commands": commands, "output": (r or {}).get("output")}
+                except Exception as e:
+                    return {"ok": False, "device_id": device_id, "commands": commands, "error": str(e)[:240]}
+
+        results = await asyncio.gather(*[_one(t) for t in targets])
+        all_ok = all(bool(x.get("ok")) for x in results if isinstance(x, dict))
+        return {"ok": all_ok, "results": results}
+
     system_prompt = (
         "你是网络领域的执行代理。现在只执行一个步骤，不要输出多余内容。\n"
         "你可以调用工具获取设备信息/执行命令。\n"
@@ -3127,6 +3178,8 @@ async def agent_run_step(req: AgentRunStepRequest):
                             result = _tool_list_devices()
                         elif name == "run_device_commands":
                             result = await _tool_run_device_commands(device_id=args.get("device_id"), commands=args.get("commands") or [])
+                        elif name == "run_multi_device_commands":
+                            result = await _tool_run_multi_device_commands(targets=args.get("targets") or [])
                         else:
                             raise ValueError("未知工具")
                     except Exception as e:
@@ -3337,6 +3390,34 @@ async def agent_chat(req: AgentChatRequest):
         {
             "type": "function",
             "function": {
+                "name": "run_multi_device_commands",
+                "description": "在多台资产设备上并行执行命令。每个 target 包含 device_id 与 commands。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "targets": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 5,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "device_id": {"type": "string"},
+                                    "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                                },
+                                "required": ["device_id", "commands"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    },
+                    "required": ["targets"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "save_skill",
                 "description": "保存/更新一条 Skill（意图->命令），用于后续自动复用。",
                 "parameters": {
@@ -3471,6 +3552,27 @@ async def agent_chat(req: AgentChatRequest):
             "commands": commands,
             "output": _truncate_text(output or "", 8000),
         }
+
+    async def _tool_run_multi_device_commands(targets: List[Dict[str, Any]]):
+        if not isinstance(targets, list) or not targets:
+            raise ValueError("PARAM_INVALID: targets 不能为空")
+        if len(targets) > 5:
+            raise ValueError("PARAM_INVALID: targets 最多 5 个")
+        sem = asyncio.Semaphore(5)
+
+        async def _one(t: Dict[str, Any]):
+            async with sem:
+                device_id = (t or {}).get("device_id")
+                commands = (t or {}).get("commands") or []
+                try:
+                    r = await _tool_run_device_commands(device_id=device_id, commands=commands)
+                    return {"ok": True, "device_id": device_id, "commands": commands, "output": (r or {}).get("output")}
+                except Exception as e:
+                    return {"ok": False, "device_id": device_id, "commands": commands, "error": str(e)[:240]}
+
+        results = await asyncio.gather(*[_one(t) for t in targets])
+        all_ok = all(bool(x.get("ok")) for x in results if isinstance(x, dict))
+        return {"ok": all_ok, "results": results}
 
     def _tool_save_skill(
         brand: str,
@@ -3662,6 +3764,8 @@ async def agent_chat(req: AgentChatRequest):
                         )
                     elif name == "run_device_commands":
                         result = await _tool_run_device_commands(device_id=args.get("device_id"), commands=args.get("commands") or [])
+                    elif name == "run_multi_device_commands":
+                        result = await _tool_run_multi_device_commands(targets=args.get("targets") or [])
                     elif name == "save_skill":
                         result = _tool_save_skill(
                             brand=args.get("brand"),
