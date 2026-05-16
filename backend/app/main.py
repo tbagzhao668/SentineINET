@@ -3045,7 +3045,7 @@ async def agent_run_step(req: AgentRunStepRequest):
         else:
             for c in commands:
                 if _looks_dangerous_command(c):
-                    raise ValueError("DENY_DANGEROUS: 检测到高风险命令，已拒绝执行")
+                    raise ValueError(f"DENY_DANGEROUS: 检测到高风险命令，已拒绝执行（命令：{str(c)[:120]}）")
             err = _agent_validate_step_commands(step_text, commands)
             if err:
                 raise ValueError(f"PARAM_MISMATCH: {err}")
@@ -3415,7 +3415,7 @@ async def agent_chat(req: AgentChatRequest):
         else:
             for c in commands:
                 if _looks_dangerous_command(c):
-                    raise ValueError("DENY_DANGEROUS: 检测到高风险命令，已拒绝执行")
+                    raise ValueError(f"DENY_DANGEROUS: 检测到高风险命令，已拒绝执行（命令：{str(c)[:120]}）")
 
         dev = db["devices"].get(device_id)
         if dev is None:
