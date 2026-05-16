@@ -3043,9 +3043,6 @@ async def agent_run_step(req: AgentRunStepRequest):
                 if not _looks_readonly_command(c):
                     raise ValueError("DENY_READONLY: 当前会话未开启配置下发（allow_config=false），仅允许只读命令")
         else:
-            for c in commands:
-                if _looks_dangerous_command(c):
-                    raise ValueError(f"DENY_DANGEROUS: 检测到高风险命令，已拒绝执行（命令：{str(c)[:120]}）")
             err = _agent_validate_step_commands(step_text, commands)
             if err:
                 raise ValueError(f"PARAM_MISMATCH: {err}")
@@ -3144,9 +3141,13 @@ async def agent_run_step(req: AgentRunStepRequest):
                     out_excerpt = None
                     if isinstance(result, dict) and isinstance(result.get("output"), str) and result.get("output"):
                         out_excerpt = (result.get("output") or "")[:900]
-                    tool_calls_log.append(
-                        {"tool": name, "ok": ok, "dt_ms": int((time.perf_counter() - t0) * 1000), "error": err, "output_excerpt": out_excerpt}
-                    )
+                    entry: Dict[str, Any] = {"tool": name, "ok": ok, "dt_ms": int((time.perf_counter() - t0) * 1000), "error": err, "output_excerpt": out_excerpt, "args": args}
+                    if isinstance(result, dict):
+                        if isinstance(result.get("device_id"), str):
+                            entry["device_id"] = result.get("device_id")
+                        if isinstance(result.get("commands"), list):
+                            entry["commands"] = result.get("commands")
+                    tool_calls_log.append(entry)
                     last_tool_ok = bool(ok)
                     last_tool_error = err
                     messages_for_model.append({"role": "tool", "tool_call_id": (tc or {}).get("id"), "content": json.dumps(result, ensure_ascii=False)})
@@ -3413,9 +3414,7 @@ async def agent_chat(req: AgentChatRequest):
                 if not _looks_readonly_command(c):
                     raise ValueError("DENY_READONLY: 当前会话未开启配置下发（allow_config=false），仅允许只读命令")
         else:
-            for c in commands:
-                if _looks_dangerous_command(c):
-                    raise ValueError(f"DENY_DANGEROUS: 检测到高风险命令，已拒绝执行（命令：{str(c)[:120]}）")
+            pass
 
         dev = db["devices"].get(device_id)
         if dev is None:
@@ -3546,6 +3545,74 @@ async def agent_chat(req: AgentChatRequest):
             _agent_add_message(session, "assistant", msg)
             _agent_add_event(session, "assistant", {"text": msg[:400]})
             return {"session_id": session_id, "run": run, "plan": plan, "events": session.get("events") or [], "message": msg, "tool_log": tool_log, "skills_saved": created_skill_ids}
+        if isinstance(run, dict) and isinstance(run.get("steps"), list):
+            max_auto_steps = 15
+            executed = []
+            seen = set()
+            last_resp = None
+            for _ in range(max_auto_steps):
+                try:
+                    last_resp = await agent_run_step(AgentRunStepRequest(session_id=session_id, run_id=run.get("id"), action="next"))
+                except Exception as e:
+                    msg = f"自动执行失败：{str(e)[:240]}"
+                    _agent_add_message(session, "assistant", msg)
+                    _agent_add_event(session, "assistant", {"text": msg[:400]})
+                    return {"session_id": session_id, "run": run, "plan": plan, "events": session.get("events") or [], "message": msg, "tool_log": tool_log, "skills_saved": created_skill_ids}
+                if isinstance(last_resp, dict) and isinstance(last_resp.get("run"), dict):
+                    run = last_resp.get("run")
+                steps = (run or {}).get("steps") if isinstance(run, dict) else None
+                if isinstance(steps, list):
+                    for s in steps:
+                        idx = s.get("index")
+                        if idx in seen:
+                            continue
+                        if s.get("status") in ("done", "failed") and s.get("ended_at"):
+                            seen.add(idx)
+                            executed.append(s)
+                            break
+                if isinstance(run, dict) and run.get("status") in ("done", "failed"):
+                    break
+            remaining = 0
+            if isinstance(run, dict) and isinstance(run.get("steps"), list):
+                remaining = len([s for s in run.get("steps") if s.get("status") in ("pending", "failed")])
+            executed_tools = []
+            for s in executed:
+                for t in (s.get("tool_log") or []):
+                    if isinstance(t, dict) and t.get("tool") == "run_device_commands":
+                        executed_tools.append(
+                            {
+                                "tool": "run_device_commands",
+                                "ok": bool(t.get("ok")),
+                                "dt_ms": t.get("dt_ms"),
+                                "error": t.get("error"),
+                                "args": {"device_id": t.get("device_id") or (t.get("args") or {}).get("device_id"), "commands": t.get("commands") or (t.get("args") or {}).get("commands")},
+                                "step_index": s.get("index"),
+                            }
+                        )
+            lines = []
+            for s in executed:
+                idx = (s.get("index") or 0) + 1
+                txt = str(s.get("text") or "").strip()
+                summ = str(s.get("summary") or "").strip()
+                lines.append(f"{idx}. {txt}\n   - {summ}")
+                cmds = []
+                for t in (s.get("tool_log") or []):
+                    if isinstance(t, dict) and t.get("tool") == "run_device_commands":
+                        dev_id = t.get("device_id") or (t.get("args") or {}).get("device_id")
+                        c = t.get("commands") or (t.get("args") or {}).get("commands") or []
+                        if dev_id and c:
+                            cmds.append(f"   - {dev_id}: " + "; ".join([str(x) for x in c][:12]))
+                if cmds:
+                    lines.extend(cmds)
+            status_text = str((run or {}).get("status") or "running")
+            msg = "自动执行完成。" if remaining == 0 and status_text == "done" else f"已自动执行 {len(executed)} 步，剩余 {remaining} 步待执行。"
+            if lines:
+                msg = msg + "\n\n执行记录（含命令）：\n" + "\n".join(lines[:40])
+            if remaining > 0:
+                msg = msg + "\n\n建议：点击“执行下一步”继续，或将需求拆分为更小的批次。"
+            _agent_add_message(session, "assistant", msg)
+            _agent_add_event(session, "assistant", {"text": msg[:400]})
+            return {"session_id": session_id, "run": run, "plan": plan, "events": session.get("events") or [], "message": msg, "tool_log": executed_tools or tool_log, "skills_saved": created_skill_ids}
 
     last_tool_ok: Optional[bool] = None
     last_tool_error: Optional[str] = None

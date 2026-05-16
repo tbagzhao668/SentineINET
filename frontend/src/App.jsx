@@ -1495,7 +1495,13 @@ const App = () => {
                                 <div className="mt-4 bg-black/40 border border-slate-800 rounded-xl p-4">
                                   <div className="text-[8px] font-black text-slate-500 uppercase tracking-[0.2em] mb-2">Tools</div>
                                   <pre className="text-[10px] font-mono text-slate-300 whitespace-pre-wrap leading-relaxed">
-                                    {toolLog.map((t, i) => `${i + 1}. ${t.tool} ${t.ok ? "ok" : "fail"} ${t.dt_ms}ms${t.error ? " · " + t.error : ""}`).join("\n")}
+                                    {toolLog.map((t, i) => {
+                                      const args = (t && typeof t === "object") ? (t.args || {}) : {};
+                                      const deviceId = args.device_id || t.device_id || "";
+                                      const cmds = Array.isArray(args.commands) ? args.commands : (Array.isArray(t.commands) ? t.commands : []);
+                                      const cmdText = (deviceId && cmds.length) ? ` · ${deviceId} · ${cmds.slice(0, 6).join(" ; ")}` : "";
+                                      return `${i + 1}. ${t.tool} ${t.ok ? "ok" : "fail"} ${t.dt_ms}ms${t.error ? " · " + t.error : ""}${cmdText}`;
+                                    }).join("\n")}
                                   </pre>
                                 </div>
                               )}
@@ -1511,7 +1517,7 @@ const App = () => {
                       <div ref={agentChatEndRef} />
                     </div>
 
-                    {!agentAutoExecute && agentRun?.steps && (
+                    {agentRun?.steps && agentRun?.status !== "done" && (
                       <div className="mt-6 flex flex-wrap gap-3">
                         <button
                           onClick={() => handleAgentRunNextStep("next")}
