@@ -3314,6 +3314,7 @@ async def agent_chat(req: AgentChatRequest):
         "3) 默认以最安全方式处理：如果 allow_config=false，则只能执行只读命令（show/display/get/ping/traceroute 等）。\n"
         "4) 当某个意图对应的一组命令在某台设备上成功执行且输出有效时，调用 save_skill 将该意图-命令沉淀为技能，以便后续自动复用。\n"
         "5) 严禁擅自改写用户给定的参数（设备ID/接口名/VLAN号/IP地址/掩码/前缀长度）；必须原样使用。\n"
+        "6) 涉及多台设备执行命令时，优先使用 run_multi_device_commands 一次并行下发；若返回结果中存在失败设备，仅针对失败设备子集重试（不要重复对已成功设备下发）。\n"
         "输出要求：中文，结构清晰；需要执行时先给计划，再执行；执行结果要摘要，必要时附关键输出片段。\n"
     )
 
